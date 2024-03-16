@@ -3,4 +3,3 @@
 
 # train with single gpu
 bash scripts/single_gpu/pose_transfer_train.sh 0
-fd
