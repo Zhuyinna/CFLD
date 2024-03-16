@@ -1,6 +1,6 @@
 #!/bin/bash
 
-source $(dirname "${CONDA_PYTHON_EXE}")/activate CFLD
+# source $(dirname "${CONDA_PYTHON_EXE}")/activate CFLD
 export CUDA_VISIBLE_DEVICES=$1
 shift
 
