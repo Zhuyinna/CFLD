@@ -5,3 +5,4 @@ from .pose_encoder import PoseEncoder
 from .swin_transformer import build_backbone
 from .unet import UNet
 from .vae import VariationalAutoencoder
+from .reference_encoder import build_rie,apply_mask

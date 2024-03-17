@@ -3,5 +3,3 @@
 
 # test with single gpu
 bash scripts/single_gpu/pose_transfer_test.sh 0 MODEL.PRETRAINED_PATH checkpoints
-fdf
-fdf
