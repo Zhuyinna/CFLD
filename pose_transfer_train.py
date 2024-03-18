@@ -20,13 +20,13 @@ from diffusers import (DDIMInverseScheduler, DDIMScheduler, DDPMScheduler,
                        EulerDiscreteScheduler, PNDMScheduler)                    
 from torch.utils.data import DataLoader
 from transformers import CLIPVisionModelWithProjection
+from transformers import Dinov2Model
 
 from datasets import PisTrainDeepFashion
 from defaults import pose_transfer_C as cfg
 from lr_scheduler import LinearWarmupMultiStepDecayLRScheduler
 from models import (AppearanceEncoder, Decoder, PoseEncoder, UNet,
                     VariationalAutoencoder, build_backbone, build_metric)
-from models import (build_rie, apply_mask)
 from pose_transfer_test import build_test_loader, eval
 from utils import AverageMeter
 
@@ -127,49 +127,108 @@ class build_model(nn.Module):
 
         return c, down_block_additional_residuals, up_block_additional_residuals
 
-# 继承自build_model，并修改forward函数
-class build_model_with_rie(build_model):
-    def __init__(self,cfg):
-        super().__init__(cfg)
 
-        # rie: reference image encoder
-        self.rie = build_rie(
-            pretrained_path=cfg.MODEL.COND_STAGE_CONFIG.RIE.PRETRAINED_PATH
+# 继承自build_model，并修改forward函数
+class build_model_CFG(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+
+        self.image_encoder_g = CLIPVisionModelWithProjection.from_pretrained(cfg.MODEL.COND_STAGE_CONFIG.CLIP_ENCODER.PRETRAINED_PATH)
+        self.image_encoder_g.requires_grad_(False)
+        # TODO：需要修改传入参数
+        # self.appearance_encoder = build_rie(
+        #         pretrained_path=cfg.MODEL.COND_STAGE_CONFIG.RIE.PRETRAINED_PATH   # ""
+        # )
+
+        self.learnable_vector = nn.Parameter(torch.randn((1, cfg.MODEL.COND_STAGE_CONFIG.CLIP_ENCODER.N_CTX, cfg.MODEL.COND_STAGE_CONFIG.CLIP_ENCODER.CTX_DIM)))
+
+
+        self.pose_query = cfg.MODEL.DECODER_CONFIG.POSE_QUERY
+
+        # backbone: swin transformer
+        self.backbone = build_backbone(
+            img_size=cfg.INPUT.COND.IMG_SIZE,
+            embed_dim=cfg.MODEL.COND_STAGE_CONFIG.EMBED_DIM,
+            depths=cfg.MODEL.COND_STAGE_CONFIG.DEPTHS,
+            num_heads=cfg.MODEL.COND_STAGE_CONFIG.NUM_HEADS,
+            window_size=cfg.MODEL.COND_STAGE_CONFIG.WINDOW_SIZE,
+            drop_path_rate=cfg.MODEL.COND_STAGE_CONFIG.DROP_PATH_RATE,
+            mask=len(cfg.INPUT.COND.PRED_RATIO) > 0,
+            last_norm=cfg.MODEL.COND_STAGE_CONFIG.LAST_NORM,
+            pretrained_path=cfg.MODEL.COND_STAGE_CONFIG.PRETRAINED_PATH
         )
 
-        # TODO: clip_encoder
-        clip_pretrained_path = cfg.MODEL.COND_STAGE_CONFIG.CLIP_ENCODER.PRETRAINED_PATH
-        self.clip_encoder = CLIPVisionModelWithProjection.from_pretrained(clip_pretrained_path)
-        self.clip_encoder.requires_grad_(False)
+        # MLP: extract features with different channels and scales
+        self.appearance_encoder = AppearanceEncoder(
+            attn_residual_block_idx=cfg.MODEL.APPEARANCE_GUIDANCE_CONFIG.ATTN_RESIDUAL_BLOCK_IDX,
+            inner_dims=cfg.MODEL.APPEARANCE_GUIDANCE_CONFIG.INNER_DIMS,
+            ctx_dims=cfg.MODEL.APPEARANCE_GUIDANCE_CONFIG.CTX_DIMS,
+            embed_dims=cfg.MODEL.APPEARANCE_GUIDANCE_CONFIG.EMBED_DIMS,
+            heads=cfg.MODEL.APPEARANCE_GUIDANCE_CONFIG.HEADS,
+            depth=cfg.MODEL.APPEARANCE_GUIDANCE_CONFIG.DEPTH,
+            to_self_attn=cfg.MODEL.APPEARANCE_GUIDANCE_CONFIG.TO_SELF_ATTN,
+            to_queries=cfg.MODEL.APPEARANCE_GUIDANCE_CONFIG.TO_QUERIES,
+            to_keys=cfg.MODEL.APPEARANCE_GUIDANCE_CONFIG.TO_KEYS,
+            to_values=cfg.MODEL.APPEARANCE_GUIDANCE_CONFIG.TO_VALUES,
+            aspect_ratio=cfg.INPUT.COND.IMG_SIZE[0] // cfg.INPUT.COND.IMG_SIZE[1],
+            detach_input=cfg.MODEL.APPEARANCE_GUIDANCE_CONFIG.DETACH_INPUT,
+            convin_kernel_size=cfg.MODEL.APPEARANCE_GUIDANCE_CONFIG.CONVIN_KERNEL_SIZE,
+            convin_stride=cfg.MODEL.APPEARANCE_GUIDANCE_CONFIG.CONVIN_STRIDE,
+            convin_padding=cfg.MODEL.APPEARANCE_GUIDANCE_CONFIG.CONVIN_PADDING
+        )
 
+        self.pose_encoder = PoseEncoder(
+            downscale_factor=cfg.MODEL.POSE_GUIDANCE_CONFIG.DOWNSCALE_FACTOR,
+            pose_channels=cfg.MODEL.POSE_GUIDANCE_CONFIG.POSE_CHANNELS,
+            in_channels=cfg.MODEL.POSE_GUIDANCE_CONFIG.IN_CHANNELS,
+            channels=cfg.MODEL.POSE_GUIDANCE_CONFIG.CHANNELS
+        )
+        self.u_cond_percent = cfg.MODEL.U_COND_PERCENT
+        self.u_cond_down_block_guidance = cfg.MODEL.U_COND_DOWN_BLOCK_GUIDANCE
+        self.u_cond_up_block_guidance = cfg.MODEL.U_COND_UP_BLOCK_GUIDANCE
     
-    def forward(self, ref_latents, rie_timesteps, batched_inputs):
-        
+    def forward(self, noisy_latents, timesteps, batch):
+        context = self.image_encoder_g(batch["clip_s_img"]).last_hidden_state
+        # context.image_embeds.shape: torch.Size([4,512])
+        # context.last_hidden_state.shape: torch.Size([4, 50, 768])
 
-        up_block_additional_residuals = self.rie(ref_latents, rie_timesteps)
-        ########up_block_additional_residuals
-        ### input
-        # ref_latents: torch.Size([16, 320, 64, 64])
-        # rie_timesteps: torch.Size([16])
+        # TODO: 能否直接concat，考虑CFG
+        # mask = batch["mask"] if "mask" in batch else None
+        # masked_ref = apply_mask(batch["img_cond"], mask=mask)
+        # masked_ref = torch.cat([masked_ref, masked_ref])
+        # features = self.appearance_encoder(noisy_latents, masked_ref, timesteps=timesteps, context=context)
+        # up_block_additional_residuals = features
 
-        ### output 
-        # len(up_block_additional_residuals): 4
-        # up_block_additional_residuals[0].shape: torch.Size([16, 320, 64, 64])
-        # up_block_additional_residuals[1].shape: torch.Size([16, 640, 32, 32])
-        # up_block_additional_residuals[2].shape: torch.Size([16, 1280, 16, 16])
-        # up_block_additional_residuals[3].shape: torch.Size([16, 1280, 8, 8])
+        mask = batch["mask"] if "mask" in batch else None
+        x, features = self.backbone(batch["img_cond"], mask=mask)
+        up_block_additional_residuals = self.appearance_encoder(features)
 
-        # encoder hidden states
-        c = self.clip_encoder(batched_inputs["img_cond"])
-        print(f'c.shape: {c.shape}')
+        bsz = x.shape[0]
+        if self.training:
+            bsz = bsz * 2
+            down_block_additional_residuals = self.pose_encoder(torch.cat([batch["pose_img_src"], batch["pose_img_tgt"]]))
+            up_block_additional_residuals = {k: torch.cat([v, v]) for k, v in up_block_additional_residuals.items()}
+            if not self.pose_query:
+                c = torch.cat([context,context])
+            u_cond_prop = torch.rand(bsz, 1, 1)
+            u_cond_prop = (u_cond_prop < self.u_cond_percent).to(dtype=x.dtype, device=x.device)
+            c = self.learnable_vector.expand(bsz, -1, -1).to(dtype=x.dtype) * u_cond_prop + c * (1 - u_cond_prop)
+            if self.u_cond_down_block_guidance:
+                down_block_additional_residuals = [torch.zeros_like(sample) * u_cond_prop.unsqueeze(1) + \
+                                                   sample * (1 - u_cond_prop.unsqueeze(1)) \
+                                                   for sample in down_block_additional_residuals]
+            if self.u_cond_up_block_guidance:
+                up_block_additional_residuals = [torch.zeros_like(sample) * u_cond_prop.unsqueeze(1) + \
+                                                   sample * (1 - u_cond_prop.unsqueeze(1)) \
+                                                   for sample in up_block_additional_residuals]
 
-        down_block_additional_residuals = self.pose_encoder(batched_inputs["pose_img"])
+        else:
+            down_block_additional_residuals = self.pose_encoder(batch["pose_img"])
+            c = torch.cat([self.learnable_vector.expand(bsz, -1, -1).to(dtype=x.dtype), c], dim=0)
+
 
         return c, down_block_additional_residuals, up_block_additional_residuals
-
         
-
-
 
 def main(cfg):
     project_dir = os.path.join("outputs", cfg.ACCELERATE.PROJECT_NAME)
@@ -248,6 +307,7 @@ def main(cfg):
         pretrained_path=cfg.MODEL.FIRST_STAGE_CONFIG.PRETRAINED_PATH
     ).to(accelerator.device, dtype=weight_dtype)
 
+    # load model
     if cfg.MODEL.SCHEDULER_CONFIG.NAME == "euler":
         noise_scheduler = EulerDiscreteScheduler.from_pretrained(cfg.MODEL.SCHEDULER_CONFIG.PRETRAINED_PATH)
     elif cfg.MODEL.SCHEDULER_CONFIG.NAME == "pndm":
@@ -256,6 +316,7 @@ def main(cfg):
         noise_scheduler = DDIMScheduler.from_pretrained(cfg.MODEL.SCHEDULER_CONFIG.PRETRAINED_PATH)
     elif cfg.MODEL.SCHEDULER_CONFIG.NAME == "ddpm":
         noise_scheduler = DDPMScheduler.from_pretrained(cfg.MODEL.SCHEDULER_CONFIG.PRETRAINED_PATH)
+
 
     inverse_noise_scheduler = DDIMInverseScheduler(
         num_train_timesteps=noise_scheduler.num_train_timesteps,
@@ -270,22 +331,24 @@ def main(cfg):
         timestep_spacing=noise_scheduler.timestep_spacing
     )
 
-    model = build_model_with_rie(cfg)
+    model_CFG = build_model_CFG(cfg)
+    # new: 修改unet
     unet = UNet(cfg)
+    # unet = ControlledUnet(cfg)
     metric = build_metric().to(accelerator.device)
-    trainable_params = sum([p.numel() for p in model.parameters() if p.requires_grad] + \
+    trainable_params = sum([p.numel() for p in model_CFG.parameters() if p.requires_grad] + \
                            [p.numel() for p in unet.parameters() if p.requires_grad])
     logger.info(f"number of trainable parameters: {trainable_params}")
 
     logger.info("preparing optimizer...")
     lr = cfg.OPTIMIZER.LR * cfg.INPUT.BATCH_SIZE if cfg.OPTIMIZER.SCALE_LR else cfg.OPTIMIZER.LR
-    params = [p for p in model.parameters() if p.requires_grad] + \
+    params = [p for p in model_CFG.parameters() if p.requires_grad] + \
              [p for p in unet.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(params, lr=lr)
 
     logger.info("preparing accelerator...")
-    model, unet, optimizer, train_loader, test_loader, fid_real_loader = accelerator.prepare(
-        model, unet, optimizer, train_loader, test_loader, fid_real_loader)
+    model_CFG, unet, optimizer, train_loader, test_loader, fid_real_loader = accelerator.prepare(
+        model_CFG, unet, optimizer, train_loader, test_loader, fid_real_loader)
 
     last_epoch = cfg.MODEL.LAST_EPOCH
     if cfg.MODEL.PRETRAINED_PATH:
@@ -304,7 +367,7 @@ def main(cfg):
     end_time = time.time()
 
     for epoch in range(last_epoch, cfg.OPTIMIZER.EPOCHS, 1):
-        model.train()
+        model_CFG.train()
         unet.train()
 
         epoch_time = time.time()
@@ -313,7 +376,7 @@ def main(cfg):
         total_loss = AverageMeter()
 
         for i, batch in enumerate(train_loader):
-            with accelerator.accumulate(model, unet):
+            with accelerator.accumulate(model_CFG, unet):
                 optimizer.zero_grad()
 
                 # Convert images to latent space
@@ -339,16 +402,36 @@ def main(cfg):
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # get embedding
-                mask = batch["mask"] if "mask" in batch else None  # mask is None
-                with accelerator.autocast():
-                    # TODO: 第二个应该是img_tgt还是img_src？？
-                    masked_ref = torch.cat([apply_mask(x,mask) for x in [batch["img_src"], batch["img_src"]]])
-                    ref_latents = vae.encode(masked_ref)
-                rie_timesteps = timesteps
-                c, down_block_additional_residuals, up_block_additional_residuals = model(ref_latents,rie_timesteps, batch)
+                c, down_block_additional_residuals, up_block_additional_residuals = model_CFG(noisy_latents, timesteps, batch)
+                
                 down_block_additional_residuals = [sample.to(dtype=weight_dtype) for sample in down_block_additional_residuals]
                 up_block_additional_residuals = {k: v.to(dtype=weight_dtype) for k, v in up_block_additional_residuals.items()}
-"""
+
+                '''
+                c.shape: torch.Size([8, 50, 768])
+
+                len of down_block_additional_residuals: 3
+                down_block_additional_residuals[0].shape: torch.Size([8, 320, 64, 64])
+                down_block_additional_residuals[1].shape: torch.Size([8, 640, 32, 32])
+                down_block_additional_residuals[2].shape: torch.Size([8, 1280, 16, 16])
+
+                len of up_block_additional_residuals: 13
+                up_block_additional_residuals_0.shape: torch.Size([8, 2560, 8, 8])
+                up_block_additional_residuals_1.shape: torch.Size([8, 2560, 8, 8])
+                up_block_additional_residuals_2.shape: torch.Size([8, 2560, 8, 8])
+                up_block_additional_residuals_3.shape: torch.Size([8, 1280, 8, 8])
+                up_block_additional_residuals_4.shape: torch.Size([8, 1280, 16, 16])
+                up_block_additional_residuals_5.shape: torch.Size([8, 1280, 16, 16])
+                up_block_additional_residuals_6.shape: torch.Size([8, 640, 16, 16])
+                up_block_additional_residuals_7.shape: torch.Size([8, 640, 32, 32])
+                up_block_additional_residuals_8.shape: torch.Size([8, 640, 32, 32])
+                up_block_additional_residuals_9.shape: torch.Size([8, 320, 32, 32])
+                up_block_additional_residuals_10.shape: torch.Size([8, 320, 64, 64])
+                up_block_additional_residuals_11.shape: torch.Size([8, 320, 64, 64])
+                up_block_additional_residuals_12.shape: torch.Size([8, 320, 64, 64])
+                '''
+
+
                 # predict
                 with accelerator.autocast():
                     encoder_hidden_states = c.to(dtype=weight_dtype)
@@ -421,7 +504,7 @@ def main(cfg):
     train_time = time.time() - start_time
     logger.info(f'training completed, running time {datetime.timedelta(seconds=int(train_time))}')
     accelerator.end_training()
-"""
+
 
 
 

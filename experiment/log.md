@@ -8,7 +8,8 @@ Lwd5gZOYP3p/
         bs=12:  cuda out memory
 
 ## 改进
-- [ ] 用dinov2提取，增加到所有注意力里
-- [ ] target通过零卷积加到upsample的Q分支input
-
+- [ ] target通过clipvision提取768特征，用于timeemd和encoder hidden states
+- [ ] source通过SD提取四个特征，再经过basictransformer分别得到up additional，可选择用于selfattention或者crossattention
+        最后一个特征，8个transformer得到另一个encoder hidden states
+        
 

@@ -15,6 +15,7 @@ import torch
 import torchvision.transforms as transforms
 from PIL import Image
 from torch.utils.data import Dataset
+from transformers import CLIPImageProcessor
 
 from pose_utils import (cords_to_map, draw_pose_from_cords,
                         load_pose_cords_from_strings)
@@ -66,6 +67,11 @@ class PisTrainDeepFashion(Dataset):
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
+        self.transform_clip = transforms.Compose([
+            transforms.RandomResizedCrop(cond_img_size, scale=(min_scale, 1.), ratio=(aspect_ratio*3./4., aspect_ratio*4./3.),
+                                         interpolation=transforms.InterpolationMode.BICUBIC, antialias=True),
+        ])
+        self.clip_image_processor = CLIPImageProcessor()
 
     def process_dir(self, root_dir, csv_file):
         data = []
@@ -98,6 +104,9 @@ class PisTrainDeepFashion(Dataset):
         img_cond = self.transform(img_from)
         pose_img_src = self.build_pose_img(img_path_from)
         pose_img_tgt = self.build_pose_img(img_path_to)
+        
+        s_img = self.transform_clip(img_from)
+        clip_s_img = (self.clip_image_processor(images=s_img, return_tensors="pt").pixel_values).squeeze(0)
 
         mask = None
         if len(self.pred_ratio) > 0:
@@ -142,6 +151,7 @@ class PisTrainDeepFashion(Dataset):
             "img_src": img_src,
             "img_tgt": img_tgt,
             "img_cond": img_cond,
+            "clip_s_img":clip_s_img,
             "pose_img_src": pose_img_src,
             "pose_img_tgt": pose_img_tgt
         }

@@ -21,4 +21,5 @@ accelerate launch \
     --dynamo_backend "no" \
     --main_process_port $PORT \
     pose_transfer_train.py $@ \
-    INPUT.ROOT_DIR ./fashion
+    INPUT.ROOT_DIR ./fashion  \
+    INPUT.BATCH_SIZE 4
