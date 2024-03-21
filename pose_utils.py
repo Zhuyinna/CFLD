@@ -32,7 +32,7 @@ def load_pose_cords_from_strings(y_str, x_str):
 def cords_to_map(cords, img_size, old_size=(128, 64), affine_matrix=None, sigma=6):
     old_size = img_size if old_size is None else old_size
     cords = cords.astype(float)
-    result = np.zeros(img_size + cords.shape[0:1], dtype='float32')
+    result = np.zeros(img_size + cords.shape[0:1], dtype='float32') 
     for i, point in enumerate(cords):
         if point[0] == -1 or point[1] == -1:
             continue
@@ -45,9 +45,9 @@ def cords_to_map(cords, img_size, old_size=(128, 64), affine_matrix=None, sigma=
         else:
             point_0 = int(point[0])
             point_1 = int(point[1])
-        xx, yy = np.meshgrid(np.arange(img_size[1]), np.arange(img_size[0]))
+        xx, yy = np.meshgrid(np.arange(img_size[1]), np.arange(img_size[0])) 
         result[..., i] = np.exp(-((yy - point_0) ** 2 + (xx - point_1) ** 2) / (2 * sigma ** 2))
-    return result
+    return result  # 返回的是一个[h,w,N]的热力图，N是关键点的个数
 
 
 def draw_pose_from_cords(array, img_size, old_size=(128, 64), radius=2, draw_bones=True):

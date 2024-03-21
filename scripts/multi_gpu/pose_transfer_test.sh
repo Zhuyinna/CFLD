@@ -1,6 +1,6 @@
 #!/bin/bash
 
-source $(dirname "${CONDA_PYTHON_EXE}")/activate CFLD
+# source $(dirname "${CONDA_PYTHON_EXE}")/activate CFLD
 export CUDA_VISIBLE_DEVICES=$1
 export NUM_GPUS=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
 shift
@@ -21,4 +21,5 @@ accelerate launch \
     --dynamo_backend "no" \
     --main_process_port $PORT \
     pose_transfer_test.py $@ \
-    INPUT.ROOT_DIR ./fashion
+    INPUT.ROOT_DIR ./fashion \
+    MODEL.PRETRAINED_PATH /home/ynzhu/workspace/CFLD/outputs/CFLD/debug/epochs_001/checkpoints/

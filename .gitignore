@@ -1,5 +1,8 @@
 # pretrained models
 fashion/
+fashion-multimodal/
+pretrained_models/
+checkpoints/
 *.safetensors
 *.pth
 *.bin

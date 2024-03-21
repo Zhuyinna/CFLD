@@ -210,6 +210,8 @@ class PisTestDeepFashion(Dataset):
 
         pose_img_from = self.build_pose_img(img_path_from)
         pose_img_to = self.build_pose_img(img_path_to)
+        
+
 
         return {
             "img_src": img_src,
@@ -223,10 +225,12 @@ class PisTestDeepFashion(Dataset):
     def build_pose_img(self, img_path):
         string = self.annotation_file.loc[os.path.basename(img_path)]
         array = load_pose_cords_from_strings(string['keypoints_y'], string['keypoints_x'])
-        pose_map = torch.tensor(cords_to_map(array, tuple(self.pose_img_size), (256, 176)).transpose(2, 0, 1), dtype=torch.float32)
-        pose_img = torch.tensor(draw_pose_from_cords(array, tuple(self.pose_img_size), (256, 176)).transpose(2, 0, 1) / 255., dtype=torch.float32)
+        pose_map = torch.tensor(cords_to_map(array, tuple(self.pose_img_size), (256, 176)).transpose(2, 0, 1), dtype=torch.float32) #[18,256,256]
+        pose_img = torch.tensor(draw_pose_from_cords(array, tuple(self.pose_img_size), (256, 176)).transpose(2, 0, 1) / 255., dtype=torch.float32) #[3,256,256]
         pose_img = torch.cat([pose_img, pose_map], dim=0)
         return pose_img
+    
+    
 
 
 class FidRealDeepFashion(Dataset):

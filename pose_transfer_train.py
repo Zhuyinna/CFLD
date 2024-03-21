@@ -100,6 +100,7 @@ class build_model(nn.Module):
         bsz = x.shape[0]
         if self.training:
             bsz = bsz * 2
+            print(f'pose img src shape: {batched_inputs["pose_img_src"].shape}')
             down_block_additional_residuals = self.pose_encoder(torch.cat([batched_inputs["pose_img_src"], batched_inputs["pose_img_tgt"]]))
             up_block_additional_residuals = {k: torch.cat([v, v]) for k, v in up_block_additional_residuals.items()}
             c = self.decoder(x, features, down_block_additional_residuals)
@@ -243,7 +244,16 @@ def main(cfg):
     last_epoch = cfg.MODEL.LAST_EPOCH
     if cfg.MODEL.PRETRAINED_PATH:
         logger.info(f"loading states from {cfg.MODEL.PRETRAINED_PATH}")
-        accelerator.load_state(cfg.MODEL.PRETRAINED_PATH)
+
+        logger.info(model.load_state_dict(torch.load(
+            os.path.join(cfg.MODEL.PRETRAINED_PATH, "pytorch_model.bin"), map_location="cpu"
+        ), strict=False))
+        logger.info(unet.load_state_dict(torch.load(
+            os.path.join(cfg.MODEL.PRETRAINED_PATH, "pytorch_model_1.bin"), map_location="cpu"
+        ), strict=False))
+
+        # accelerator.load_state(cfg.MODEL.PRETRAINED_PATH)
+
     global_step = last_epoch * len(train_loader)
 
     logger.info("preparing lr scheduler...")
