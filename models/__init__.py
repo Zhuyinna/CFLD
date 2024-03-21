@@ -3,5 +3,5 @@ from .decoder import Decoder
 from .metrics import build_metric
 from .pose_encoder import PoseEncoder
 from .swin_transformer import build_backbone
-from .unet import UNet
+from .unet import UNet, ExtendedUNet
 from .vae import VariationalAutoencoder

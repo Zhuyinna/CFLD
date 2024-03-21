@@ -12,6 +12,17 @@ from diffusers.models.transformer_2d import *
 from diffusers.models.unet_2d_blocks import *
 from diffusers.models.unet_2d_condition import *
 
+from ldm.modules.diffusionmodules.util import (
+    conv_nd,
+    linear,
+    zero_module,
+    timestep_embedding,
+    normalization
+)
+import torch.autograd as autograd
+autograd.set_detect_anomaly(True)
+
+from .warping_transformer import CustomSpatialTransformer
 
 class ResidualXFormersAttnProcessor(XFormersAttnProcessor):
     def __call__(
@@ -885,8 +896,8 @@ class ResidualCrossAttnUpBlock2D(CrossAttnUpBlock2D):
             if not dual_cross_attention:
                 attentions.append(
                     ResidualTransformer2DModel(
-                        num_attention_heads,
-                        out_channels // num_attention_heads,
+                        num_attention_heads,   # num of heads
+                        out_channels // num_attention_heads,  # dim of each head
                         in_channels=out_channels,
                         num_layers=transformer_layers_per_block,
                         cross_attention_dim=cross_attention_dim,
@@ -928,7 +939,7 @@ class ResidualCrossAttnUpBlock2D(CrossAttnUpBlock2D):
         attention_mask: Optional[torch.FloatTensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         block_idx: Optional[int] = None,
-        additional_residuals: Optional[Dict[str, torch.FloatTensor]] = None
+        additional_residuals: Optional[Dict[str, torch.FloatTensor]] = None, 
     ):
         for j, (resnet, attn) in enumerate(zip(self.resnets, self.attentions)):
             # pop res hidden states
@@ -990,6 +1001,337 @@ class ResidualCrossAttnUpBlock2D(CrossAttnUpBlock2D):
 
         return hidden_states
 
+class ExtendedResidualCrossAttnUpBlock2D(CrossAttnUpBlock2D):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        prev_output_channel: int,
+        temb_channels: int,
+        dropout: float = 0.0,
+        num_layers: int = 1,
+        transformer_layers_per_block: int = 1,
+        resnet_eps: float = 1e-6,
+        resnet_time_scale_shift: str = "default",
+        resnet_act_fn: str = "swish",
+        resnet_groups: int = 32,
+        resnet_pre_norm: bool = True,
+        num_attention_heads=1,   #8
+        cross_attention_dim=1280,  #为什么是768
+        output_scale_factor=1.0,
+        add_upsample=True,
+        dual_cross_attention=False,
+        use_linear_projection=False,
+        only_cross_attention=False,
+        upcast_attention=False,
+        use_zero_crossattn=False, # new_add
+        use_atv_loss=False, # new_add
+    ):
+        super(CrossAttnUpBlock2D, self).__init__()
+        resnets = []
+        attentions = []
+        warpflows = []
+        warpzc = []
+        self.has_cross_attention = True
+        self.num_attention_heads = num_attention_heads
+        # new add
+        self.use_atv_loss = use_atv_loss
+        self.use_zero_crossattn = use_zero_crossattn
+
+        for i in range(num_layers):  # num_layers=3
+            # 在每个block的最后一层使用loss
+            if i==num_layers-1:
+                warpflows_use_loss = True
+            else:
+                warpflows_use_loss = False
+            
+            res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
+            resnet_in_channels = prev_output_channel if i == 0 else out_channels
+
+            resnets.append(
+                ResidualResnetBlock2D(
+                    in_channels=resnet_in_channels + res_skip_channels,
+                    out_channels=out_channels,
+                    temb_channels=temb_channels,
+                    eps=resnet_eps,
+                    groups=resnet_groups,
+                    dropout=dropout,
+                    time_embedding_norm=resnet_time_scale_shift,
+                    non_linearity=resnet_act_fn,
+                    output_scale_factor=output_scale_factor,
+                    pre_norm=resnet_pre_norm,
+                )
+            )
+            if not dual_cross_attention:
+                attentions.append(
+                    ResidualTransformer2DModel(
+                        num_attention_heads,
+                        out_channels // num_attention_heads,
+                        in_channels=out_channels,
+                        num_layers=transformer_layers_per_block,
+                        cross_attention_dim=cross_attention_dim,
+                        norm_num_groups=resnet_groups,
+                        use_linear_projection=use_linear_projection,
+                        only_cross_attention=only_cross_attention,
+                        upcast_attention=upcast_attention,
+                    )
+                )
+            else:
+                attentions.append(
+                    DualTransformer2DModel(
+                        num_attention_heads,
+                        out_channels // num_attention_heads,
+                        in_channels=out_channels,
+                        num_layers=1,
+                        cross_attention_dim=cross_attention_dim,
+                        norm_num_groups=resnet_groups,
+                    )
+                )
+            
+            warpflows.append(
+                CustomSpatialTransformer(
+                    in_channels=out_channels,   
+                    n_heads=num_attention_heads,   #8
+                    d_head=64, #TODO：是否需要修改
+                    depth=transformer_layers_per_block, # 应当为1 #self.transformer_depth,
+                    context_dim=out_channels, #TODO:因为输入的context和hidden_states维度一样，所以暂时定为这个 输入的cond的通道数 #cont_ch,
+                    use_linear=False,
+                    use_checkpoint=False,
+                    use_loss=warpflows_use_loss #idx%3 == 1,
+                )
+            )
+            warpzc.append(self.make_zero_conv(out_channels))
+                          
+        self.attentions = nn.ModuleList(attentions)
+        self.resnets = nn.ModuleList(resnets)
+
+        self.warpflows = nn.ModuleList(warpflows)
+        self.warpzc = nn.ModuleList(warpzc)
+
+        if add_upsample:
+            self.upsamplers = nn.ModuleList([Upsample2D(out_channels, use_conv=True, out_channels=out_channels)])
+        else:
+            self.upsamplers = None
+
+        self.gradient_checkpointing = False
+        
+
+
+    def make_zero_conv(self, channels):
+        return zero_module(conv_nd(2, channels, channels, 1, padding=0))
+
+    def forward(
+        self,
+        hidden_states: torch.FloatTensor,
+        res_hidden_states_tuple: Tuple[torch.FloatTensor, ...],
+        temb: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        upsample_size: Optional[int] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        block_idx: Optional[int] = None,
+        additional_residuals: Optional[Dict[str, torch.FloatTensor]] = None,
+        mask_st: Optional[torch.FloatTensor] = None,
+    ):
+        '''
+        if not self.use_zero_crossattn:
+            for j, (resnet, attn) in enumerate(zip(self.resnets, self.attentions)):
+                # pop res hidden states
+                res_hidden_states = res_hidden_states_tuple[-1]
+                res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+                hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1) 
+
+                if self.training and self.gradient_checkpointing:
+
+                    def create_custom_forward(module, return_dict=None):
+                        def custom_forward(*inputs):
+                            if return_dict is not None:
+                                return module(*inputs, return_dict=return_dict)
+                            else:
+                                return module(*inputs)
+
+                        return custom_forward
+
+                    ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                    hidden_states = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(resnet),
+                        hidden_states,
+                        temb,
+                        block_idx * len(self.resnets) + j,
+                        additional_residuals,
+                        **ckpt_kwargs,
+                    )
+                    hidden_states = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(attn, return_dict=False),
+                        hidden_states,
+                        encoder_hidden_states,
+                        None,  # timestep
+                        None,  # class_labels
+                        cross_attention_kwargs,
+                        attention_mask,
+                        encoder_attention_mask,
+                        block_idx * len(self.resnets) + j,
+                        additional_residuals,
+                        **ckpt_kwargs,
+                    )[0]
+                else:
+                    hidden_states = resnet(hidden_states, temb,
+                                        block_idx * len(self.resnets) + j,
+                                        additional_residuals)
+                    hidden_states = attn(
+                        hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                        attention_mask=attention_mask,
+                        encoder_attention_mask=encoder_attention_mask,
+                        return_dict=False,
+                        block_idx=block_idx * len(self.resnets) + j,
+                        additional_residuals=additional_residuals
+                    )[0]
+
+            if self.upsamplers is not None:
+                for upsampler in self.upsamplers:
+                    hidden_states = upsampler(hidden_states, upsample_size)
+
+            return hidden_states
+        '''
+    # else:
+        for j, (resnet, attn, warpfl, warpzc) in enumerate(zip(self.resnets, self.attentions, self.warpflows, self.warpzc)):
+            # pop res hidden states
+            res_hidden_states = res_hidden_states_tuple[-1]
+            res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)   # 先不加res_hidden_states，等到zero_cross_attention之后再加
+        
+
+            if self.training and self.gradient_checkpointing:
+
+                def create_custom_forward(module, return_dict=None):
+                    def custom_forward(*inputs):
+                        if return_dict is not None:
+                            return module(*inputs, return_dict=return_dict)
+                        else:
+                            return module(*inputs)
+
+                    return custom_forward
+
+                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(resnet),
+                    hidden_states,
+                    temb,
+                    block_idx * len(self.resnets) + j,
+                    additional_residuals,
+                    **ckpt_kwargs,
+                )
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(attn, return_dict=False),
+                    hidden_states,
+                    encoder_hidden_states,
+                    None,  # timestep
+                    None,  # class_labels
+                    cross_attention_kwargs,
+                    attention_mask,
+                    encoder_attention_mask,
+                    block_idx * len(self.resnets) + j,
+                    additional_residuals,
+                    **ckpt_kwargs,
+                )[0]
+                # new add: warp_flow_blocks：放在resnet和cross attn之后
+                idx = block_idx * len(self.resnets) + j
+                if f"block_{idx}_cross_attn_q" in additional_residuals:
+                    hint = additional_residuals[f"block_{idx}_cross_attn_q"]
+                    # # hint 需要rearrange："b c h w -> b (h w) c"
+                    # hint = hint.permute(0, 2, 3, 1).reshape(hint.shape[0], -1, hint.shape[1])
+                    # hint = hint.contiguous()
+                else:
+                    print(f"block_{idx}_cross_attn_q not in additional_residuals")
+                    hint = None
+                # TODO: 是否传回loss，新增参数self.use_atv_loss
+                if self.use_atv_loss:
+                    output, warp_attn_loss = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(warpfl),
+                        hidden_states,   # x
+                        hint,   # context
+                        None, # mask
+                        mask_st, # mask1
+                        mask_st, # mask2
+                        False, # use_attention_mask
+                        True, # use_attention_tv_loss
+                        None, # tv_loss_type
+                        **ckpt_kwargs,
+                    )
+                    output = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(warpzc),
+                        output,
+                        **ckpt_kwargs
+                    )
+                    hidden_states = hidden_states + output
+                else:
+                    output = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(warpfl),
+                        hidden_states,   # x
+                        hint,   # context
+                    )
+                    output = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(warpzc),
+                        output,
+                        **ckpt_kwargs
+                    )
+                    hidden_states = hidden_states + output
+                    warp_attn_loss = 0                        
+
+            else:
+            
+                hidden_states = resnet(hidden_states, temb,
+                                    block_idx * len(self.resnets) + j,
+                                    additional_residuals)
+                hidden_states = attn(
+                    hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    attention_mask=attention_mask,
+                    encoder_attention_mask=encoder_attention_mask,
+                    return_dict=False,
+                    block_idx=block_idx * len(self.resnets) + j,
+                    additional_residuals=additional_residuals
+                )[0]
+                idx = block_idx * len(self.resnets) + j
+                if f"block_{idx}_cross_attn_q" in additional_residuals:
+                    hint = additional_residuals[f"block_{idx}_cross_attn_q"]
+                else:
+                    print(f"block_{idx}_cross_attn_q not in additional_residuals")
+                    hint = None
+                output = warpfl(
+                    hidden_states,   # x
+                    hint,   # context
+                    None, # mask
+                    None, # mask1
+                    None, # mask2
+                    False, # use_attention_mask
+                    True, # use_attention_tv_loss
+                    None, # tv_loss_type
+                )
+                output = warpzc(
+                    output
+                )
+                hidden_states = hidden_states + output      
+
+
+        if self.upsamplers is not None:
+            for upsampler in self.upsamplers:
+                hidden_states = upsampler(hidden_states, upsample_size)
+        
+        # new add : wether return warp_attn_loss
+        if self.use_atv_loss:
+            return hidden_states, warp_attn_loss
+        else:
+            return hidden_states, 0
+
+
+
+
 
 def get_residual_up_block(
     up_block_type,
@@ -1015,6 +1357,8 @@ def get_residual_up_block(
     cross_attention_norm=None,
     attention_head_dim=None,
     upsample_type=None,
+    use_zero_crossattn=False,  # new add
+    use_atv_loss=False,  # new add
 ):
     # If attn head dim is not defined, we default it to the number of heads
     if attention_head_dim is None:
@@ -1055,7 +1399,28 @@ def get_residual_up_block(
     elif up_block_type == "CrossAttnUpBlock2D":
         if cross_attention_dim is None:
             raise ValueError("cross_attention_dim must be specified for CrossAttnUpBlock2D")
-        return ResidualCrossAttnUpBlock2D(
+        # if not use_zero_crossattn:
+        #     return ResidualCrossAttnUpBlock2D(
+        #         num_layers=num_layers,
+        #         transformer_layers_per_block=transformer_layers_per_block,
+        #         in_channels=in_channels,
+        #         out_channels=out_channels,
+        #         prev_output_channel=prev_output_channel,
+        #         temb_channels=temb_channels,
+        #         add_upsample=add_upsample,
+        #         resnet_eps=resnet_eps,
+        #         resnet_act_fn=resnet_act_fn,
+        #         resnet_groups=resnet_groups,
+        #         cross_attention_dim=cross_attention_dim,
+        #         num_attention_heads=num_attention_heads,
+        #         dual_cross_attention=dual_cross_attention,
+        #         use_linear_projection=use_linear_projection,
+        #         only_cross_attention=only_cross_attention,
+        #         upcast_attention=upcast_attention,
+        #         resnet_time_scale_shift=resnet_time_scale_shift,
+        #     )
+        # else:
+        return ExtendedResidualCrossAttnUpBlock2D(
             num_layers=num_layers,
             transformer_layers_per_block=transformer_layers_per_block,
             in_channels=in_channels,
@@ -1072,7 +1437,9 @@ def get_residual_up_block(
             use_linear_projection=use_linear_projection,
             only_cross_attention=only_cross_attention,
             upcast_attention=upcast_attention,
-            resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_time_scale_shift=resnet_time_scale_shift, 
+            use_zero_crossattn=use_zero_crossattn,  # new add
+            use_atv_loss=use_atv_loss,  # new add              
         )
     elif up_block_type == "SimpleCrossAttnUpBlock2D":
         if cross_attention_dim is None:
@@ -1902,13 +2269,722 @@ class ResidualUNet2DConditionModel(UNet2DConditionModel):
 
         return UNet2DConditionOutput(sample=sample)
 
+class ExtendedUNet2DConditionOutput(UNet2DConditionOutput):
+    """
+    The output of [`ExtendedUNet2DConditionOutput`].
 
+    Args:
+        sample (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
+            The hidden states output conditioned on `encoder_hidden_states` input. Output of last layer of model.
+    """
+    def __init__(self, sample=None, attn_loss=None):
+            super().__init__(sample=sample)  # 调用父类构造函数
+            self.attn_loss = attn_loss  # 处理额外的 attn_loss 参数
+    # sample: torch.FloatTensor = None
+    # attn_loss: torch.FloatTensor = None
+
+class ExtendedResidualUNet2DConditionModel(UNet2DConditionModel):
+    # config详见：/CFLD/pretrained_models/unet/config.json
+    @register_to_config
+    def __init__(
+        self,
+        sample_size: Optional[int] = None,
+        in_channels: int = 4,   #4
+        out_channels: int = 4,
+        center_input_sample: bool = False, # False
+        flip_sin_to_cos: bool = True,  #true
+        freq_shift: int = 0,  #0
+        down_block_types: Tuple[str] = (
+            "CrossAttnDownBlock2D",
+            "CrossAttnDownBlock2D",
+            "CrossAttnDownBlock2D",
+            "DownBlock2D",
+        ),
+        mid_block_type: Optional[str] = "UNetMidBlock2DCrossAttn",
+        up_block_types: Tuple[str] = ("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
+        only_cross_attention: Union[bool, Tuple[bool]] = False,
+        block_out_channels: Tuple[int] = (320, 640, 1280, 1280),  # [320,640,1280,1280]
+        layers_per_block: Union[int, Tuple[int]] = 2,   #2
+        downsample_padding: int = 1,
+        mid_block_scale_factor: float = 1,
+        act_fn: str = "silu",
+        norm_num_groups: Optional[int] = 32,
+        norm_eps: float = 1e-5,
+        cross_attention_dim: Union[int, Tuple[int]] = 1280,  #768
+        transformer_layers_per_block: Union[int, Tuple[int]] = 1,
+        encoder_hid_dim: Optional[int] = None,
+        encoder_hid_dim_type: Optional[str] = None,
+        attention_head_dim: Union[int, Tuple[int]] = 8,
+        num_attention_heads: Optional[Union[int, Tuple[int]]] = None,
+        dual_cross_attention: bool = False,
+        use_linear_projection: bool = False,
+        class_embed_type: Optional[str] = None,
+        addition_embed_type: Optional[str] = None,
+        addition_time_embed_dim: Optional[int] = None,
+        num_class_embeds: Optional[int] = None,
+        upcast_attention: bool = False,
+        resnet_time_scale_shift: str = "default",
+        resnet_skip_time_act: bool = False,
+        resnet_out_scale_factor: int = 1.0,
+        time_embedding_type: str = "positional",
+        time_embedding_dim: Optional[int] = None,
+        time_embedding_act_fn: Optional[str] = None,
+        timestep_post_act: Optional[str] = None,
+        time_cond_proj_dim: Optional[int] = None,
+        conv_in_kernel: int = 3,
+        conv_out_kernel: int = 3,
+        projection_class_embeddings_input_dim: Optional[int] = None,
+        class_embeddings_concat: bool = False,
+        mid_block_only_cross_attention: Optional[bool] = None,
+        cross_attention_norm: Optional[str] = None,
+        addition_embed_type_num_heads=64,
+        use_zero_crossattn: bool = True,  # TODO：在篇retrain/unet .json文件中
+        use_atv_loss: bool = False, # TODO
+    ):
+        super(UNet2DConditionModel, self).__init__()
+
+        self.sample_size = sample_size
+
+        if num_attention_heads is not None:
+            raise ValueError(
+                "At the moment it is not possible to define the number of attention heads via `num_attention_heads` because of a naming issue as described in https://github.com/huggingface/diffusers/issues/2011#issuecomment-1547958131. Passing `num_attention_heads` will only be supported in diffusers v0.19."
+            )
+
+        # If `num_attention_heads` is not defined (which is the case for most models)
+        # it will default to `attention_head_dim`. This looks weird upon first reading it and it is.
+        # The reason for this behavior is to correct for incorrectly named variables that were introduced
+        # when this library was created. The incorrect naming was only discovered much later in https://github.com/huggingface/diffusers/issues/2011#issuecomment-1547958131
+        # Changing `attention_head_dim` to `num_attention_heads` for 40,000+ configurations is too backwards breaking
+        # which is why we correct for the naming here.
+        num_attention_heads = num_attention_heads or attention_head_dim
+
+        # Check inputs
+        if len(down_block_types) != len(up_block_types):
+            raise ValueError(
+                f"Must provide the same number of `down_block_types` as `up_block_types`. `down_block_types`: {down_block_types}. `up_block_types`: {up_block_types}."
+            )
+
+        if len(block_out_channels) != len(down_block_types):
+            raise ValueError(
+                f"Must provide the same number of `block_out_channels` as `down_block_types`. `block_out_channels`: {block_out_channels}. `down_block_types`: {down_block_types}."
+            )
+
+        if not isinstance(only_cross_attention, bool) and len(only_cross_attention) != len(down_block_types):
+            raise ValueError(
+                f"Must provide the same number of `only_cross_attention` as `down_block_types`. `only_cross_attention`: {only_cross_attention}. `down_block_types`: {down_block_types}."
+            )
+
+        if not isinstance(num_attention_heads, int) and len(num_attention_heads) != len(down_block_types):
+            raise ValueError(
+                f"Must provide the same number of `num_attention_heads` as `down_block_types`. `num_attention_heads`: {num_attention_heads}. `down_block_types`: {down_block_types}."
+            )
+
+        if not isinstance(attention_head_dim, int) and len(attention_head_dim) != len(down_block_types):
+            raise ValueError(
+                f"Must provide the same number of `attention_head_dim` as `down_block_types`. `attention_head_dim`: {attention_head_dim}. `down_block_types`: {down_block_types}."
+            )
+
+        if isinstance(cross_attention_dim, list) and len(cross_attention_dim) != len(down_block_types):
+            raise ValueError(
+                f"Must provide the same number of `cross_attention_dim` as `down_block_types`. `cross_attention_dim`: {cross_attention_dim}. `down_block_types`: {down_block_types}."
+            )
+
+        if not isinstance(layers_per_block, int) and len(layers_per_block) != len(down_block_types):
+            raise ValueError(
+                f"Must provide the same number of `layers_per_block` as `down_block_types`. `layers_per_block`: {layers_per_block}. `down_block_types`: {down_block_types}."
+            )
+
+        # input
+        conv_in_padding = (conv_in_kernel - 1) // 2
+        self.conv_in = nn.Conv2d(
+            in_channels, block_out_channels[0], kernel_size=conv_in_kernel, padding=conv_in_padding
+        )
+
+        # time
+        if time_embedding_type == "fourier":
+            time_embed_dim = time_embedding_dim or block_out_channels[0] * 2
+            if time_embed_dim % 2 != 0:
+                raise ValueError(f"`time_embed_dim` should be divisible by 2, but is {time_embed_dim}.")
+            self.time_proj = GaussianFourierProjection(
+                time_embed_dim // 2, set_W_to_weight=False, log=False, flip_sin_to_cos=flip_sin_to_cos
+            )
+            timestep_input_dim = time_embed_dim
+        elif time_embedding_type == "positional":
+            time_embed_dim = time_embedding_dim or block_out_channels[0] * 4
+
+            self.time_proj = Timesteps(block_out_channels[0], flip_sin_to_cos, freq_shift)
+            timestep_input_dim = block_out_channels[0]
+        else:
+            raise ValueError(
+                f"{time_embedding_type} does not exist. Please make sure to use one of `fourier` or `positional`."
+            )
+
+        self.time_embedding = TimestepEmbedding(
+            timestep_input_dim,
+            time_embed_dim,
+            act_fn=act_fn,
+            post_act_fn=timestep_post_act,
+            cond_proj_dim=time_cond_proj_dim,
+        )
+
+        if encoder_hid_dim_type is None and encoder_hid_dim is not None:
+            encoder_hid_dim_type = "text_proj"
+            self.register_to_config(encoder_hid_dim_type=encoder_hid_dim_type)
+            logger.info("encoder_hid_dim_type defaults to 'text_proj' as `encoder_hid_dim` is defined.")
+
+        if encoder_hid_dim is None and encoder_hid_dim_type is not None:
+            raise ValueError(
+                f"`encoder_hid_dim` has to be defined when `encoder_hid_dim_type` is set to {encoder_hid_dim_type}."
+            )
+
+        if encoder_hid_dim_type == "text_proj":
+            self.encoder_hid_proj = nn.Linear(encoder_hid_dim, cross_attention_dim)
+        elif encoder_hid_dim_type == "text_image_proj":
+            # image_embed_dim DOESN'T have to be `cross_attention_dim`. To not clutter the __init__ too much
+            # they are set to `cross_attention_dim` here as this is exactly the required dimension for the currently only use
+            # case when `addition_embed_type == "text_image_proj"` (Kadinsky 2.1)`
+            self.encoder_hid_proj = TextImageProjection(
+                text_embed_dim=encoder_hid_dim,
+                image_embed_dim=cross_attention_dim,
+                cross_attention_dim=cross_attention_dim,
+            )
+        elif encoder_hid_dim_type == "image_proj":
+            # Kandinsky 2.2
+            self.encoder_hid_proj = ImageProjection(
+                image_embed_dim=encoder_hid_dim,
+                cross_attention_dim=cross_attention_dim,
+            )
+        elif encoder_hid_dim_type is not None:
+            raise ValueError(
+                f"encoder_hid_dim_type: {encoder_hid_dim_type} must be None, 'text_proj' or 'text_image_proj'."
+            )
+        else:
+            self.encoder_hid_proj = None
+
+        # class embedding
+        if class_embed_type is None and num_class_embeds is not None:
+            self.class_embedding = nn.Embedding(num_class_embeds, time_embed_dim)
+        elif class_embed_type == "timestep":
+            self.class_embedding = TimestepEmbedding(timestep_input_dim, time_embed_dim, act_fn=act_fn)
+        elif class_embed_type == "identity":
+            self.class_embedding = nn.Identity(time_embed_dim, time_embed_dim)
+        elif class_embed_type == "projection":
+            if projection_class_embeddings_input_dim is None:
+                raise ValueError(
+                    "`class_embed_type`: 'projection' requires `projection_class_embeddings_input_dim` be set"
+                )
+            # The projection `class_embed_type` is the same as the timestep `class_embed_type` except
+            # 1. the `class_labels` inputs are not first converted to sinusoidal embeddings
+            # 2. it projects from an arbitrary input dimension.
+            #
+            # Note that `TimestepEmbedding` is quite general, being mainly linear layers and activations.
+            # When used for embedding actual timesteps, the timesteps are first converted to sinusoidal embeddings.
+            # As a result, `TimestepEmbedding` can be passed arbitrary vectors.
+            self.class_embedding = TimestepEmbedding(projection_class_embeddings_input_dim, time_embed_dim)
+        elif class_embed_type == "simple_projection":
+            if projection_class_embeddings_input_dim is None:
+                raise ValueError(
+                    "`class_embed_type`: 'simple_projection' requires `projection_class_embeddings_input_dim` be set"
+                )
+            self.class_embedding = nn.Linear(projection_class_embeddings_input_dim, time_embed_dim)
+        else:
+            self.class_embedding = None
+
+        if addition_embed_type == "text":
+            if encoder_hid_dim is not None:
+                text_time_embedding_from_dim = encoder_hid_dim
+            else:
+                text_time_embedding_from_dim = cross_attention_dim
+
+            self.add_embedding = TextTimeEmbedding(
+                text_time_embedding_from_dim, time_embed_dim, num_heads=addition_embed_type_num_heads
+            )
+        elif addition_embed_type == "text_image":
+            # text_embed_dim and image_embed_dim DON'T have to be `cross_attention_dim`. To not clutter the __init__ too much
+            # they are set to `cross_attention_dim` here as this is exactly the required dimension for the currently only use
+            # case when `addition_embed_type == "text_image"` (Kadinsky 2.1)`
+            self.add_embedding = TextImageTimeEmbedding(
+                text_embed_dim=cross_attention_dim, image_embed_dim=cross_attention_dim, time_embed_dim=time_embed_dim
+            )
+        elif addition_embed_type == "text_time":
+            self.add_time_proj = Timesteps(addition_time_embed_dim, flip_sin_to_cos, freq_shift)
+            self.add_embedding = TimestepEmbedding(projection_class_embeddings_input_dim, time_embed_dim)
+        elif addition_embed_type == "image":
+            # Kandinsky 2.2
+            self.add_embedding = ImageTimeEmbedding(image_embed_dim=encoder_hid_dim, time_embed_dim=time_embed_dim)
+        elif addition_embed_type == "image_hint":
+            # Kandinsky 2.2 ControlNet
+            self.add_embedding = ImageHintTimeEmbedding(image_embed_dim=encoder_hid_dim, time_embed_dim=time_embed_dim)
+        elif addition_embed_type is not None:
+            raise ValueError(f"addition_embed_type: {addition_embed_type} must be None, 'text' or 'text_image'.")
+
+        if time_embedding_act_fn is None:
+            self.time_embed_act = None
+        else:
+            self.time_embed_act = get_activation(time_embedding_act_fn)
+
+        self.down_blocks = nn.ModuleList([])
+        self.up_blocks = nn.ModuleList([])
+
+        if isinstance(only_cross_attention, bool):
+            if mid_block_only_cross_attention is None:
+                mid_block_only_cross_attention = only_cross_attention
+
+            only_cross_attention = [only_cross_attention] * len(down_block_types)
+
+        if mid_block_only_cross_attention is None:
+            mid_block_only_cross_attention = False
+
+        if isinstance(num_attention_heads, int):
+            num_attention_heads = (num_attention_heads,) * len(down_block_types)
+
+        if isinstance(attention_head_dim, int):
+            attention_head_dim = (attention_head_dim,) * len(down_block_types)
+
+        if isinstance(cross_attention_dim, int):
+            cross_attention_dim = (cross_attention_dim,) * len(down_block_types)
+
+        if isinstance(layers_per_block, int):
+            layers_per_block = [layers_per_block] * len(down_block_types)
+
+        if isinstance(transformer_layers_per_block, int):
+            transformer_layers_per_block = [transformer_layers_per_block] * len(down_block_types)
+
+        if class_embeddings_concat:
+            # The time embeddings are concatenated with the class embeddings. The dimension of the
+            # time embeddings passed to the down, middle, and up blocks is twice the dimension of the
+            # regular time embeddings
+            blocks_time_embed_dim = time_embed_dim * 2
+        else:
+            blocks_time_embed_dim = time_embed_dim
+
+        # down
+        output_channel = block_out_channels[0]
+        for i, down_block_type in enumerate(down_block_types):
+            input_channel = output_channel
+            output_channel = block_out_channels[i]
+            is_final_block = i == len(block_out_channels) - 1
+
+            down_block = get_down_block(
+                down_block_type,
+                num_layers=layers_per_block[i],
+                transformer_layers_per_block=transformer_layers_per_block[i],
+                in_channels=input_channel,
+                out_channels=output_channel,
+                temb_channels=blocks_time_embed_dim,
+                add_downsample=not is_final_block,
+                resnet_eps=norm_eps,
+                resnet_act_fn=act_fn,
+                resnet_groups=norm_num_groups,
+                cross_attention_dim=cross_attention_dim[i],
+                num_attention_heads=num_attention_heads[i],
+                downsample_padding=downsample_padding,
+                dual_cross_attention=dual_cross_attention,
+                use_linear_projection=use_linear_projection,
+                only_cross_attention=only_cross_attention[i],
+                upcast_attention=upcast_attention,
+                resnet_time_scale_shift=resnet_time_scale_shift,
+                resnet_skip_time_act=resnet_skip_time_act,
+                resnet_out_scale_factor=resnet_out_scale_factor,
+                cross_attention_norm=cross_attention_norm,
+                attention_head_dim=attention_head_dim[i] if attention_head_dim[i] is not None else output_channel,
+            )
+            self.down_blocks.append(down_block)
+
+        # mid
+        if mid_block_type == "UNetMidBlock2DCrossAttn":
+            self.mid_block = UNetMidBlock2DCrossAttn(
+                transformer_layers_per_block=transformer_layers_per_block[-1],
+                in_channels=block_out_channels[-1],
+                temb_channels=blocks_time_embed_dim,
+                resnet_eps=norm_eps,
+                resnet_act_fn=act_fn,
+                output_scale_factor=mid_block_scale_factor,
+                resnet_time_scale_shift=resnet_time_scale_shift,
+                cross_attention_dim=cross_attention_dim[-1],
+                num_attention_heads=num_attention_heads[-1],
+                resnet_groups=norm_num_groups,
+                dual_cross_attention=dual_cross_attention,
+                use_linear_projection=use_linear_projection,
+                upcast_attention=upcast_attention,
+            )
+        elif mid_block_type == "UNetMidBlock2DSimpleCrossAttn":
+            self.mid_block = UNetMidBlock2DSimpleCrossAttn(
+                in_channels=block_out_channels[-1],
+                temb_channels=blocks_time_embed_dim,
+                resnet_eps=norm_eps,
+                resnet_act_fn=act_fn,
+                output_scale_factor=mid_block_scale_factor,
+                cross_attention_dim=cross_attention_dim[-1],
+                attention_head_dim=attention_head_dim[-1],
+                resnet_groups=norm_num_groups,
+                resnet_time_scale_shift=resnet_time_scale_shift,
+                skip_time_act=resnet_skip_time_act,
+                only_cross_attention=mid_block_only_cross_attention,
+                cross_attention_norm=cross_attention_norm,
+            )
+        elif mid_block_type is None:
+            self.mid_block = None
+        else:
+            raise ValueError(f"unknown mid_block_type : {mid_block_type}")
+
+        # count how many layers upsample the images
+        self.num_upsamplers = 0
+
+        # up
+        reversed_block_out_channels = list(reversed(block_out_channels))
+        reversed_num_attention_heads = list(reversed(num_attention_heads))
+        reversed_layers_per_block = list(reversed(layers_per_block))
+        reversed_cross_attention_dim = list(reversed(cross_attention_dim))
+        reversed_transformer_layers_per_block = list(reversed(transformer_layers_per_block))
+        only_cross_attention = list(reversed(only_cross_attention))
+
+        output_channel = reversed_block_out_channels[0]
+        for i, up_block_type in enumerate(up_block_types):
+            is_final_block = i == len(block_out_channels) - 1 # 是否是4个block里的最后一块
+
+            prev_output_channel = output_channel
+            output_channel = reversed_block_out_channels[i]
+            input_channel = reversed_block_out_channels[min(i + 1, len(block_out_channels) - 1)]
+
+            # add upsample block for all BUT final layer
+            if not is_final_block:
+                add_upsample = True
+                self.num_upsamplers += 1
+            else:
+                add_upsample = False
+
+            up_block = get_residual_up_block(
+                up_block_type,
+                num_layers=reversed_layers_per_block[i] + 1,
+                transformer_layers_per_block=reversed_transformer_layers_per_block[i],
+                in_channels=input_channel,
+                out_channels=output_channel,
+                prev_output_channel=prev_output_channel,
+                temb_channels=blocks_time_embed_dim,
+                add_upsample=add_upsample,
+                resnet_eps=norm_eps,
+                resnet_act_fn=act_fn,
+                resnet_groups=norm_num_groups,
+                cross_attention_dim=reversed_cross_attention_dim[i],
+                num_attention_heads=reversed_num_attention_heads[i],
+                dual_cross_attention=dual_cross_attention,
+                use_linear_projection=use_linear_projection,
+                only_cross_attention=only_cross_attention[i],
+                upcast_attention=upcast_attention,
+                resnet_time_scale_shift=resnet_time_scale_shift,
+                resnet_skip_time_act=resnet_skip_time_act,
+                resnet_out_scale_factor=resnet_out_scale_factor,
+                cross_attention_norm=cross_attention_norm,
+                attention_head_dim=attention_head_dim[i] if attention_head_dim[i] is not None else output_channel,
+                use_zero_crossattn=use_zero_crossattn,  # new add
+                use_atv_loss=use_atv_loss,  # new add
+            )
+            self.up_blocks.append(up_block)
+            prev_output_channel = output_channel  
+
+        # out
+        if norm_num_groups is not None:
+            self.conv_norm_out = nn.GroupNorm(
+                num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=norm_eps
+            )
+
+            self.conv_act = get_activation(act_fn)
+
+        else:
+            self.conv_norm_out = None
+            self.conv_act = None
+
+        conv_out_padding = (conv_out_kernel - 1) // 2
+        self.conv_out = nn.Conv2d(
+            block_out_channels[0], out_channels, kernel_size=conv_out_kernel, padding=conv_out_padding
+        )
+        
+
+    def forward(
+        self,
+        sample: torch.FloatTensor,
+        timestep: Union[torch.Tensor, float, int],
+        encoder_hidden_states: torch.Tensor,
+        class_labels: Optional[torch.Tensor] = None,
+        timestep_cond: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
+        down_block_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
+        mid_block_additional_residual: Optional[torch.Tensor] = None,
+        up_block_additional_residuals: Optional[Dict[str, torch.Tensor]] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        return_dict: bool = True,
+        mask_st: Optional[torch.Tensor] = None,
+    ) -> Union[UNet2DConditionOutput, Tuple]:
+        default_overall_up_factor = 2**self.num_upsamplers
+        # new：增加loss
+        attn_loss=0
+
+        # upsample size should be forwarded when sample is not a multiple of `default_overall_up_factor`
+        forward_upsample_size = False
+        upsample_size = None
+
+        if any(s % default_overall_up_factor != 0 for s in sample.shape[-2:]):
+            logger.info("Forward upsample size to force interpolation output size.")
+            forward_upsample_size = True
+
+        # ensure attention_mask is a bias, and give it a singleton query_tokens dimension
+        # expects mask of shape:
+        #   [batch, key_tokens]
+        # adds singleton query_tokens dimension:
+        #   [batch,                    1, key_tokens]
+        # this helps to broadcast it as a bias over attention scores, which will be in one of the following shapes:
+        #   [batch,  heads, query_tokens, key_tokens] (e.g. torch sdp attn)
+        #   [batch * heads, query_tokens, key_tokens] (e.g. xformers or classic attn)
+        if attention_mask is not None:
+            # assume that mask is expressed as:
+            #   (1 = keep,      0 = discard)
+            # convert mask into a bias that can be added to attention scores:
+            #       (keep = +0,     discard = -10000.0)
+            attention_mask = (1 - attention_mask.to(sample.dtype)) * -10000.0
+            attention_mask = attention_mask.unsqueeze(1)
+
+        # convert encoder_attention_mask to a bias the same way we do for attention_mask
+        if encoder_attention_mask is not None:
+            encoder_attention_mask = (1 - encoder_attention_mask.to(sample.dtype)) * -10000.0
+            encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
+
+        # 0. center input if necessary
+        if self.config.center_input_sample:
+            sample = 2 * sample - 1.0
+
+        # 1. time
+        timesteps = timestep
+        if not torch.is_tensor(timesteps):
+            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
+            # This would be a good case for the `match` statement (Python 3.10+)
+            is_mps = sample.device.type == "mps"
+            if isinstance(timestep, float):
+                dtype = torch.float32 if is_mps else torch.float64
+            else:
+                dtype = torch.int32 if is_mps else torch.int64
+            timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
+        elif len(timesteps.shape) == 0:
+            timesteps = timesteps[None].to(sample.device)
+
+        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+        timesteps = timesteps.expand(sample.shape[0])
+
+        t_emb = self.time_proj(timesteps)
+
+        # `Timesteps` does not contain any weights and will always return f32 tensors
+        # but time_embedding might actually be running in fp16. so we need to cast here.
+        # there might be better ways to encapsulate this.
+        t_emb = t_emb.to(dtype=sample.dtype)
+
+        emb = self.time_embedding(t_emb, timestep_cond)
+        aug_emb = None
+
+        if self.class_embedding is not None:
+            if class_labels is None:
+                raise ValueError("class_labels should be provided when num_class_embeds > 0")
+
+            if self.config.class_embed_type == "timestep":
+                class_labels = self.time_proj(class_labels)
+
+                # `Timesteps` does not contain any weights and will always return f32 tensors
+                # there might be better ways to encapsulate this.
+                class_labels = class_labels.to(dtype=sample.dtype)
+
+            class_emb = self.class_embedding(class_labels).to(dtype=sample.dtype)
+
+            if self.config.class_embeddings_concat:
+                emb = torch.cat([emb, class_emb], dim=-1)
+            else:
+                emb = emb + class_emb
+
+        if self.config.addition_embed_type == "text":
+            aug_emb = self.add_embedding(encoder_hidden_states)
+        elif self.config.addition_embed_type == "text_image":
+            # Kandinsky 2.1 - style
+            if "image_embeds" not in added_cond_kwargs:
+                raise ValueError(
+                    f"{self.__class__} has the config param `addition_embed_type` set to 'text_image' which requires the keyword argument `image_embeds` to be passed in `added_cond_kwargs`"
+                )
+
+            image_embs = added_cond_kwargs.get("image_embeds")
+            text_embs = added_cond_kwargs.get("text_embeds", encoder_hidden_states)
+            aug_emb = self.add_embedding(text_embs, image_embs)
+        elif self.config.addition_embed_type == "text_time":
+            # SDXL - style
+            if "text_embeds" not in added_cond_kwargs:
+                raise ValueError(
+                    f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `text_embeds` to be passed in `added_cond_kwargs`"
+                )
+            text_embeds = added_cond_kwargs.get("text_embeds")
+            if "time_ids" not in added_cond_kwargs:
+                raise ValueError(
+                    f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `time_ids` to be passed in `added_cond_kwargs`"
+                )
+            time_ids = added_cond_kwargs.get("time_ids")
+            time_embeds = self.add_time_proj(time_ids.flatten())
+            time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
+
+            add_embeds = torch.concat([text_embeds, time_embeds], dim=-1)
+            add_embeds = add_embeds.to(emb.dtype)
+            aug_emb = self.add_embedding(add_embeds)
+        elif self.config.addition_embed_type == "image":
+            # Kandinsky 2.2 - style
+            if "image_embeds" not in added_cond_kwargs:
+                raise ValueError(
+                    f"{self.__class__} has the config param `addition_embed_type` set to 'image' which requires the keyword argument `image_embeds` to be passed in `added_cond_kwargs`"
+                )
+            image_embs = added_cond_kwargs.get("image_embeds")
+            aug_emb = self.add_embedding(image_embs)
+        elif self.config.addition_embed_type == "image_hint":
+            # Kandinsky 2.2 - style
+            if "image_embeds" not in added_cond_kwargs or "hint" not in added_cond_kwargs:
+                raise ValueError(
+                    f"{self.__class__} has the config param `addition_embed_type` set to 'image_hint' which requires the keyword arguments `image_embeds` and `hint` to be passed in `added_cond_kwargs`"
+                )
+            image_embs = added_cond_kwargs.get("image_embeds")
+            hint = added_cond_kwargs.get("hint")
+            aug_emb, hint = self.add_embedding(image_embs, hint)
+            sample = torch.cat([sample, hint], dim=1)
+
+        emb = emb + aug_emb if aug_emb is not None else emb
+
+        if self.time_embed_act is not None:
+            emb = self.time_embed_act(emb)
+
+        if self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "text_proj":
+            encoder_hidden_states = self.encoder_hid_proj(encoder_hidden_states)
+        elif self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "text_image_proj":
+            # Kadinsky 2.1 - style
+            if "image_embeds" not in added_cond_kwargs:
+                raise ValueError(
+                    f"{self.__class__} has the config param `encoder_hid_dim_type` set to 'text_image_proj' which requires the keyword argument `image_embeds` to be passed in  `added_conditions`"
+                )
+
+            image_embeds = added_cond_kwargs.get("image_embeds")
+            encoder_hidden_states = self.encoder_hid_proj(encoder_hidden_states, image_embeds)
+        elif self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "image_proj":
+            # Kandinsky 2.2 - style
+            if "image_embeds" not in added_cond_kwargs:
+                raise ValueError(
+                    f"{self.__class__} has the config param `encoder_hid_dim_type` set to 'image_proj' which requires the keyword argument `image_embeds` to be passed in  `added_conditions`"
+                )
+            image_embeds = added_cond_kwargs.get("image_embeds")
+            encoder_hidden_states = self.encoder_hid_proj(image_embeds)
+        # 2. pre-process
+        sample = self.conv_in(sample)
+
+        # 3. down
+
+        is_controlnet = mid_block_additional_residual is not None and down_block_additional_residuals is not None
+        is_adapter = mid_block_additional_residual is None and down_block_additional_residuals is not None
+
+        down_block_res_samples = (sample,)
+        for downsample_block in self.down_blocks:
+            if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
+                # For t2i-adapter CrossAttnDownBlock2D
+                additional_residuals = {}
+                if is_adapter and len(down_block_additional_residuals) > 0:
+                    additional_residuals["additional_residuals"] = down_block_additional_residuals.pop(0)
+
+                sample, res_samples = downsample_block(
+                    hidden_states=sample,
+                    temb=emb,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=attention_mask,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    encoder_attention_mask=encoder_attention_mask,
+                    **additional_residuals,
+                )
+            else:
+                sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
+
+                if is_adapter and len(down_block_additional_residuals) > 0:
+                    sample += down_block_additional_residuals.pop(0)
+
+            down_block_res_samples += res_samples
+
+        if is_controlnet:
+            new_down_block_res_samples = ()
+
+            for down_block_res_sample, down_block_additional_residual in zip(
+                down_block_res_samples, down_block_additional_residuals
+            ):
+                down_block_res_sample = down_block_res_sample + down_block_additional_residual
+                new_down_block_res_samples = new_down_block_res_samples + (down_block_res_sample,)
+
+            down_block_res_samples = new_down_block_res_samples
+
+        # 4. mid
+        if self.mid_block is not None:
+            sample = self.mid_block(
+                sample,
+                emb,
+                encoder_hidden_states=encoder_hidden_states,
+                attention_mask=attention_mask,
+                cross_attention_kwargs=cross_attention_kwargs,
+                encoder_attention_mask=encoder_attention_mask,
+            )
+
+        if is_controlnet:
+            sample = sample + mid_block_additional_residual
+        
+        # 5. up
+            
+        for i, upsample_block in enumerate(self.up_blocks):
+            is_final_block = i == len(self.up_blocks) - 1
+
+            res_samples = down_block_res_samples[-len(upsample_block.resnets) :]
+            down_block_res_samples = down_block_res_samples[: -len(upsample_block.resnets)]
+
+            # if we have not reached the final block and need to forward the
+            # upsample size, we do it here
+            if not is_final_block and forward_upsample_size:
+                upsample_size = down_block_res_samples[-1].shape[2:]
+
+            if hasattr(upsample_block, "has_cross_attention") and upsample_block.has_cross_attention:
+                sample, attn_loss = upsample_block(
+                    hidden_states=sample,
+                    temb=emb,
+                    res_hidden_states_tuple=res_samples,
+                    encoder_hidden_states=encoder_hidden_states,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    upsample_size=upsample_size,
+                    attention_mask=attention_mask,
+                    encoder_attention_mask=encoder_attention_mask,
+                    block_idx=i, # newly added
+                    additional_residuals=up_block_additional_residuals, # newly added
+                    mask_st=mask_st,
+                )                        
+            else:
+                sample = upsample_block(
+                    hidden_states=sample, temb=emb, res_hidden_states_tuple=res_samples, upsample_size=upsample_size,
+                    additional_residuals=up_block_additional_residuals # newly added
+                )
+        
+
+
+        # 6. post-process
+        if self.conv_norm_out:
+            sample = self.conv_norm_out(sample)
+            sample = self.conv_act(sample)
+        sample = self.conv_out(sample)
+
+        if not return_dict:
+            return (sample, )
+        else:
+            return ExtendedUNet2DConditionOutput(sample=sample,)
+       
+
+        
 class UNet(nn.Module):
     def __init__(self, cfg):
         super().__init__()
 
         self.model = ResidualUNet2DConditionModel.from_pretrained(
-            cfg.MODEL.UNET_CONFIG.PRETRAINED_PATH, use_safetensors = True)
+             cfg.MODEL.UNET_CONFIG.PRETRAINED_PATH, use_safetensors = True)
         self.model.requires_grad_(False)
         self.model.enable_xformers_memory_efficient_attention()
 
@@ -1944,3 +3020,59 @@ class UNet(nn.Module):
 
     def forward(self, sample, timestep, **kwargs):
         return self.model(sample, timestep, **kwargs).sample
+
+
+        
+class ExtendedUNet(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+
+        # new: 增加ignore_missing_keys参数
+        
+        self.model = ExtendedResidualUNet2DConditionModel.from_pretrained(
+             cfg.MODEL.UNET_CONFIG.PRETRAINED_PATH, use_safetensors = True, low_cpu_mem_usage=False, device_map=None)
+
+        self.model.requires_grad_(False)
+        self.model.enable_xformers_memory_efficient_attention()
+
+        self.model.enable_gradient_checkpointing()
+
+        for i, up_block in enumerate(self.model.up_blocks):
+            if isinstance(up_block, ExtendedResidualCrossAttnUpBlock2D):
+                # attentions中的Wk和Wv是可训练的
+                for j, (attn, warpfl, warpzc) in enumerate(zip(up_block.attentions, up_block.warpflows, up_block.warpzc)):
+                    assert isinstance(attn, ResidualTransformer2DModel)
+                    block_idx = i * len(up_block.attentions) + j
+                    # [11, 10, 9, 8, 7, 6, 5, 4, 3]
+                    # 第0，1，2块block不参与训练
+                    if block_idx not in cfg.MODEL.UNET_CONFIG.TRAINABLE_BLOCK_IDX:
+                        continue
+                    
+                    assert len(attn.transformer_blocks) == 1
+                    assert isinstance(attn.transformer_blocks[0], ResidualTransformerBlock)
+
+                    self_attn = attn.transformer_blocks[0].attn1
+                    assert isinstance(self_attn, ResidualAttention)
+                    if cfg.MODEL.UNET_CONFIG.TRAIN_SELF_ATTN_Q:
+                        self_attn.to_q.requires_grad_(True)
+                    if cfg.MODEL.UNET_CONFIG.TRAIN_SELF_ATTN_K:
+                        self_attn.to_k.requires_grad_(True)
+                    if cfg.MODEL.UNET_CONFIG.TRAIN_SELF_ATTN_V:
+                        self_attn.to_v.requires_grad_(True)
+
+                    cross_attn = attn.transformer_blocks[0].attn2
+                    assert isinstance(cross_attn, ResidualAttention)
+                    if cfg.MODEL.UNET_CONFIG.TRAIN_CROSS_ATTN_Q:
+                        cross_attn.to_q.requires_grad_(True)
+                    if cfg.MODEL.UNET_CONFIG.TRAIN_CROSS_ATTN_K:
+                        cross_attn.to_k.requires_grad_(True)
+                    if cfg.MODEL.UNET_CONFIG.TRAIN_CROSS_ATTN_V:
+                        cross_attn.to_v.requires_grad_(True)
+                    
+                    # new add: warpfl and warpzc均需要参与训练
+                    warpfl.requires_grad_(True)
+                    warpzc.requires_grad_(True)
+
+    def forward(self, sample, timestep, **kwargs):
+
+        return self.model(sample, timestep, **kwargs).sample #, self.model(sample, timestep, **kwargs).attn_loss

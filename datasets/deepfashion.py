@@ -18,7 +18,7 @@ from torch.utils.data import Dataset
 from transformers import CLIPImageProcessor
 
 from pose_utils import (cords_to_map, draw_pose_from_cords,
-                        load_pose_cords_from_strings)
+                        load_pose_cords_from_strings,draw_pose_and_mask_from_cords)
 
 logger = logging.getLogger()
 
@@ -70,6 +70,7 @@ class PisTrainDeepFashion(Dataset):
         self.transform_clip = transforms.Compose([
             transforms.RandomResizedCrop(cond_img_size, scale=(min_scale, 1.), ratio=(aspect_ratio*3./4., aspect_ratio*4./3.),
                                          interpolation=transforms.InterpolationMode.BICUBIC, antialias=True),
+            transforms.RandomHorizontalFlip(p=0.5),                                         
         ])
         self.clip_image_processor = CLIPImageProcessor()
 
@@ -102,8 +103,8 @@ class PisTrainDeepFashion(Dataset):
         img_src = self.transform_gt(img_from)
         img_tgt = self.transform_gt(img_to)
         img_cond = self.transform(img_from)
-        pose_img_src = self.build_pose_img(img_path_from)
-        pose_img_tgt = self.build_pose_img(img_path_to)
+        pose_img_src, mask_src = self.build_pose_img(img_path_from)
+        pose_img_tgt, mask_tgt= self.build_pose_img(img_path_to)
         
         s_img = self.transform_clip(img_from)
         clip_s_img = (self.clip_image_processor(images=s_img, return_tensors="pt").pixel_values).squeeze(0)
@@ -153,7 +154,9 @@ class PisTrainDeepFashion(Dataset):
             "img_cond": img_cond,
             "clip_s_img":clip_s_img,
             "pose_img_src": pose_img_src,
-            "pose_img_tgt": pose_img_tgt
+            "pose_img_tgt": pose_img_tgt,
+            "mask_src": mask_src,
+            "mask_tgt": mask_tgt
         }
         if mask is not None:
             return_dict["mask"] = mask
@@ -163,10 +166,10 @@ class PisTrainDeepFashion(Dataset):
         string = self.annotation_file.loc[os.path.basename(img_path)]
         array = load_pose_cords_from_strings(string['keypoints_y'], string['keypoints_x'])
         pose_map = torch.tensor(cords_to_map(array, tuple(self.pose_img_size), (256, 176)).transpose(2, 0, 1), dtype=torch.float32)
-        pose_img = torch.tensor(draw_pose_from_cords(array, tuple(self.pose_img_size), (256, 176)).transpose(2, 0, 1) / 255., dtype=torch.float32)
+        colors, mask = draw_pose_and_mask_from_cords(array, tuple(self.pose_img_size), (256, 176))
+        pose_img = torch.tensor(colors.transpose(2, 0, 1) / 255., dtype=torch.float32)
         pose_img = torch.cat([pose_img, pose_map], dim=0)
-        return pose_img
-
+        return pose_img, mask
 
 class PisTestDeepFashion(Dataset):
     def __init__(self, root_dir, gt_img_size, pose_img_size, cond_img_size, test_img_size):
@@ -196,6 +199,12 @@ class PisTestDeepFashion(Dataset):
             transforms.ToTensor()
         ])
 
+        self.transform_clip = transforms.Compose([
+            transforms.Resize(cond_img_size, interpolation=transforms.InterpolationMode.BICUBIC, antialias=True),
+        ])
+
+        self.clip_image_processor = CLIPImageProcessor()
+
     def process_dir(self, root_dir, csv_file):
         data = []
         for i in range(len(csv_file)):
@@ -218,6 +227,9 @@ class PisTestDeepFashion(Dataset):
         img_gt = self.transform_test(img_to) # for metrics, 3x256x176
         img_cond_from = self.transform_cond(img_from)
 
+        s_img = self.transform_clip(img_from)
+        clip_s_img = (self.clip_image_processor(images=s_img, return_tensors="pt").pixel_values).squeeze(0)
+
         pose_img_from = self.build_pose_img(img_path_from)
         pose_img_to = self.build_pose_img(img_path_to)
 
@@ -226,6 +238,7 @@ class PisTestDeepFashion(Dataset):
             "img_tgt": img_tgt,
             "img_gt": img_gt,
             "img_cond_from": img_cond_from,
+            "clip_s_img":clip_s_img,
             "pose_img_from": pose_img_from,
             "pose_img_to": pose_img_to
         }
@@ -234,7 +247,7 @@ class PisTestDeepFashion(Dataset):
         string = self.annotation_file.loc[os.path.basename(img_path)]
         array = load_pose_cords_from_strings(string['keypoints_y'], string['keypoints_x'])
         pose_map = torch.tensor(cords_to_map(array, tuple(self.pose_img_size), (256, 176)).transpose(2, 0, 1), dtype=torch.float32)
-        pose_img = torch.tensor(draw_pose_from_cords(array, tuple(self.pose_img_size), (256, 176)).transpose(2, 0, 1) / 255., dtype=torch.float32)
+        pose_img = torch.tensor(draw_pose_and_mask_from_cords(array, tuple(self.pose_img_size), (256, 176)).transpose(2, 0, 1) / 255., dtype=torch.float32)
         pose_img = torch.cat([pose_img, pose_map], dim=0)
         return pose_img
 

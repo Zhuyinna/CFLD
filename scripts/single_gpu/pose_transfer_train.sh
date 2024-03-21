@@ -6,5 +6,4 @@ shift
 
 python pose_transfer_train.py $@ \
     INPUT.ROOT_DIR ./fashion \
-    INPUT.BATCH_SIZE 4 \
-    MODEL.PRETRAINED_PATH "./checkpoints" 
+    INPUT.BATCH_SIZE 1

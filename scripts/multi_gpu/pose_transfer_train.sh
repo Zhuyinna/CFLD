@@ -13,7 +13,6 @@ do
         break;
     fi
 done
-
 accelerate launch \
     --multi_gpu \
     --num_processes $NUM_GPUS \
@@ -22,4 +21,5 @@ accelerate launch \
     --main_process_port $PORT \
     pose_transfer_train.py $@ \
     INPUT.ROOT_DIR ./fashion  \
-    INPUT.BATCH_SIZE 4
+    INPUT.BATCH_SIZE  64 \
+    MODEL.PRETRAINED_PATH "./checkpoints/"

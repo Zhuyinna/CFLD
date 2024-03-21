@@ -63,6 +63,7 @@ def draw_pose_from_cords(array, img_size, old_size=(128, 64), radius=2, draw_bon
                 continue
             cv2.line(colors, (int(array[f][1] * scale_x), int(array[f][0] * scale_y)),
                      (int(array[t][1] * scale_x), int(array[t][0] * scale_y)), BONE_COLORS[i], radius, cv2.LINE_AA)
+            
 
     for i, joint in enumerate(array):
         if array[i][0] == -1 or array[i][1] == -1:
@@ -70,3 +71,32 @@ def draw_pose_from_cords(array, img_size, old_size=(128, 64), radius=2, draw_bon
         cv2.circle(colors, (int(joint[1] * scale_x), int(joint[0] * scale_y)), radius + 1, JOINT_COLORS[i], -1, cv2.LINE_AA)
 
     return colors
+
+
+def draw_pose_and_mask_from_cords(array, img_size, old_size=(128, 64), radius=2, draw_bones=True, mask_thickness=10):
+    colors = np.zeros(shape=img_size + (3, ), dtype=np.uint8)
+    mask = np.zeros(shape=img_size, dtype=np.uint8) # 用于生成掩码的单通道图像
+    scale_y = img_size[0] / old_size[0]
+    scale_x = img_size[1] / old_size[1]
+
+    if draw_bones:
+        for i, (f, t) in enumerate(BONES):
+            from_missing = array[f][0] == -1 or array[f][1] == -1
+            to_missing = array[t][0] == -1 or array[t][1] == -1
+            if from_missing or to_missing:
+                continue
+            cv2.line(colors, (int(array[f][1] * scale_x), int(array[f][0] * scale_y)),
+                     (int(array[t][1] * scale_x), int(array[t][0] * scale_y)), BONE_COLORS[i], radius, cv2.LINE_AA)
+            # 生成掩码
+            cv2.line(mask, (int(array[f][1] * scale_x), int(array[f][0] * scale_y)),
+                     (int(array[t][1] * scale_x), int(array[t][0] * scale_y)), 1, mask_thickness, cv2.LINE_AA)
+
+    for i, joint in enumerate(array):
+        if array[i][0] == -1 or array[i][1] == -1:
+            continue
+        cv2.circle(colors, (int(joint[1] * scale_x), int(joint[0] * scale_y)), radius + 1, JOINT_COLORS[i], -1, cv2.LINE_AA)
+        # 在掩码上绘制关节点
+        cv2.circle(mask, (int(joint[1] * scale_x), int(joint[0] * scale_y)), radius + 1, 1, -1, cv2.LINE_AA)
+    # 增加一个维度使其形状变为(1, H, W)
+    mask = np.expand_dims(mask, axis=0)
+    return colors, mask

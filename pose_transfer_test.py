@@ -82,10 +82,12 @@ def eval(cfg, model, test_loader, fid_real_loader, weight_dtype, save_dir,
             if cfg.TEST.DDIM_INVERSION_STEPS > 0:
                 if cfg.TEST.DDIM_INVERSION_DOWN_BLOCK_GUIDANCE:
                     c, down_block_additional_residuals, up_block_additional_residuals = model({
-                        "img_cond": test_batch["img_cond_from"], "pose_img": test_batch["pose_img_from"]})
+                        "img_cond": test_batch["img_cond_from"], "pose_img": test_batch["pose_img_from"],
+                        "clip_s_img": test_batch["clip_s_img"]})
                 else:
                     c, down_block_additional_residuals, up_block_additional_residuals = model({
-                        "img_cond": test_batch["img_cond_from"], "pose_img": test_batch["pose_img_to"]})
+                        "img_cond": test_batch["img_cond_from"], "pose_img": test_batch["pose_img_to"],
+                        "clip_s_img": test_batch["clip_s_img"]})
 
                 noisy_latents = inverse_sample(
                     cfg.TEST.DDIM_INVERSION_STEPS, accelerator, inverse_noise_scheduler, vae, unet,
@@ -94,12 +96,15 @@ def eval(cfg, model, test_loader, fid_real_loader, weight_dtype, save_dir,
                     {k: v.to(dtype=weight_dtype) for k, v in up_block_additional_residuals.items()} if cfg.TEST.DDIM_INVERSION_UP_BLOCK_GUIDANCE else None)
             else:
                 c, down_block_additional_residuals, up_block_additional_residuals = model({
-                    "img_cond": test_batch["img_cond_from"], "pose_img": test_batch["pose_img_to"]})
+                    "img_cond": test_batch["img_cond_from"], "pose_img": test_batch["pose_img_to"],
+                    "clip_s_img": test_batch["clip_s_img"]
+                    })
                 noisy_latents = torch.randn((bsz, 4, img_size[0]//8, img_size[1]//8)).to(accelerator.device)
 
             if cfg.TEST.DDIM_INVERSION_STEPS > 0 and cfg.TEST.DDIM_INVERSION_DOWN_BLOCK_GUIDANCE:
                 c, down_block_additional_residuals, up_block_additional_residuals = model({
-                    "img_cond": test_batch["img_cond_from"], "pose_img": test_batch["pose_img_to"]})
+                    "img_cond": test_batch["img_cond_from"], "pose_img": test_batch["pose_img_to"],
+                    "clip_s_img": test_batch["clip_s_img"]})
 
             sampling_imgs = sample(
                 cfg, weight_dtype, accelerator, noise_scheduler, vae, unet, noisy_latents,
@@ -457,14 +462,30 @@ def main(cfg):
         timestep_spacing=noise_scheduler.timestep_spacing
     )
 
-    from pose_transfer_train import build_model
+    from pose_transfer_train import build_model_CFG as build_model
     model = build_model(cfg)
     unet = UNet(cfg)
     metric = build_metric().to(accelerator.device)
 
-    logger.info(model.load_state_dict(torch.load(
-        os.path.join(cfg.MODEL.PRETRAINED_PATH, "pytorch_model.bin"), map_location="cpu"
-    ), strict=False))
+    # logger.info(model.load_state_dict(torch.load(
+    #     os.path.join(cfg.MODEL.PRETRAINED_PATH, "pytorch_model.bin"), map_location="cpu"
+    # ), strict=False))
+    # logger.info(unet.load_state_dict(torch.load(
+    #     os.path.join(cfg.MODEL.PRETRAINED_PATH, "pytorch_model_1.bin"), map_location="cpu"
+    # ), strict=False))
+
+    # model_CFG
+    model_weight_path = os.path.join(cfg.MODEL.PRETRAINED_PATH,"pytorch_model.bin")
+    state_dict = torch.load(model_weight_path, map_location="cpu")
+    state_dict.pop("learnable_vector")
+    # 删掉state_dict中以decoder开头的key和learnable_vector
+    update_state_dict = {}
+    for k,v in state_dict.items():
+        if not k.startswith('decoder') and not k.startswith('learnable_vector'):
+            update_state_dict[k] = v
+    logger.info(model.load_state_dict(update_state_dict, strict=False))
+
+    # unet
     logger.info(unet.load_state_dict(torch.load(
         os.path.join(cfg.MODEL.PRETRAINED_PATH, "pytorch_model_1.bin"), map_location="cpu"
     ), strict=False))

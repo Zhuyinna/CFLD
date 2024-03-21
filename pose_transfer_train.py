@@ -20,12 +20,11 @@ from diffusers import (DDIMInverseScheduler, DDIMScheduler, DDPMScheduler,
                        EulerDiscreteScheduler, PNDMScheduler)                    
 from torch.utils.data import DataLoader
 from transformers import CLIPVisionModelWithProjection
-from transformers import Dinov2Model
 
 from datasets import PisTrainDeepFashion
 from defaults import pose_transfer_C as cfg
 from lr_scheduler import LinearWarmupMultiStepDecayLRScheduler
-from models import (AppearanceEncoder, Decoder, PoseEncoder, UNet,
+from models import (AppearanceEncoder, Decoder, PoseEncoder, UNet, ExtendedUNet,
                     VariationalAutoencoder, build_backbone, build_metric)
 from pose_transfer_test import build_test_loader, eval
 from utils import AverageMeter
@@ -33,6 +32,9 @@ from utils import AverageMeter
 warnings.filterwarnings("ignore")
 logger = logging.getLogger()
 
+# os.environ['WANDB_DISABLED'] = 'true'los
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
 
 class build_model(nn.Module):
     def __init__(self, cfg):
@@ -134,14 +136,9 @@ class build_model_CFG(nn.Module):
         super().__init__()
 
         self.image_encoder_g = CLIPVisionModelWithProjection.from_pretrained(cfg.MODEL.COND_STAGE_CONFIG.CLIP_ENCODER.PRETRAINED_PATH)
-        self.image_encoder_g.requires_grad_(False)
-        # TODO：需要修改传入参数
-        # self.appearance_encoder = build_rie(
-        #         pretrained_path=cfg.MODEL.COND_STAGE_CONFIG.RIE.PRETRAINED_PATH   # ""
-        # )
+
 
         self.learnable_vector = nn.Parameter(torch.randn((1, cfg.MODEL.COND_STAGE_CONFIG.CLIP_ENCODER.N_CTX, cfg.MODEL.COND_STAGE_CONFIG.CLIP_ENCODER.CTX_DIM)))
-
 
         self.pose_query = cfg.MODEL.DECODER_CONFIG.POSE_QUERY
 
@@ -187,7 +184,7 @@ class build_model_CFG(nn.Module):
         self.u_cond_down_block_guidance = cfg.MODEL.U_COND_DOWN_BLOCK_GUIDANCE
         self.u_cond_up_block_guidance = cfg.MODEL.U_COND_UP_BLOCK_GUIDANCE
     
-    def forward(self, noisy_latents, timesteps, batch):
+    def forward(self, batch):
         context = self.image_encoder_g(batch["clip_s_img"]).last_hidden_state
         # context.image_embeds.shape: torch.Size([4,512])
         # context.last_hidden_state.shape: torch.Size([4, 50, 768])
@@ -224,7 +221,7 @@ class build_model_CFG(nn.Module):
 
         else:
             down_block_additional_residuals = self.pose_encoder(batch["pose_img"])
-            c = torch.cat([self.learnable_vector.expand(bsz, -1, -1).to(dtype=x.dtype), c], dim=0)
+            c = torch.cat([self.learnable_vector.expand(bsz, -1, -1).to(dtype=x.dtype), context], dim=0)
 
 
         return c, down_block_additional_residuals, up_block_additional_residuals
@@ -240,7 +237,13 @@ def main(cfg):
         project_dir=project_dir,
         mixed_precision=cfg.ACCELERATE.MIXED_PRECISION,
         gradient_accumulation_steps=cfg.ACCELERATE.GRADIENT_ACCUMULATION_STEPS,
-        kwargs_handlers=[DistributedDataParallelKwargs(bucket_cap_mb=200, gradient_as_bucket_view=True)]
+        kwargs_handlers=[
+            DistributedDataParallelKwargs(
+                bucket_cap_mb=200, 
+                gradient_as_bucket_view=True,
+                find_unused_parameters=False,  # 添加这个参数
+            )
+        ]
     )
     torch.backends.cuda.matmul.allow_tf32 = cfg.ACCELERATE.ALLOW_TF32
     set_seed(cfg.ACCELERATE.SEED)
@@ -269,9 +272,14 @@ def main(cfg):
         console_handler.setLevel(logging.INFO)
         console_handler.setFormatter(logging.Formatter(fmt, datefmt))
         logger.addHandler(console_handler)
+        # new add:同时输出到一个txt文件 
+        file_handler = logging.FileHandler("/home/ynzhu/workspace/CFLD/experiment/console_output_log.txt", "a")
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter(fmt, datefmt))
+        logger.addHandler(file_handler) 
 
     logger.info(f"running with config:\n{str(cfg)}")
-
+    
     logger.info("preparing datasets...")
     train_data = PisTrainDeepFashion(
         root_dir=cfg.INPUT.ROOT_DIR,
@@ -294,7 +302,7 @@ def main(cfg):
     )
 
     test_loader, fid_real_loader, test_data, fid_real_data = build_test_loader(cfg)
-
+    
     logger.info("preparing model...")
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -332,13 +340,29 @@ def main(cfg):
     )
 
     model_CFG = build_model_CFG(cfg)
+    model_CFG.requires_grad_(False)
+    
     # new: 修改unet
-    unet = UNet(cfg)
-    # unet = ControlledUnet(cfg)
+    # unet = UNet(cfg)
+    unet = ExtendedUNet(cfg)
+    
     metric = build_metric().to(accelerator.device)
     trainable_params = sum([p.numel() for p in model_CFG.parameters() if p.requires_grad] + \
                            [p.numel() for p in unet.parameters() if p.requires_grad])
     logger.info(f"number of trainable parameters: {trainable_params}")
+
+    # new add
+    # 打印模型结构以及参数,logger指定输出到文件
+    with open('./experiment/model_parameter.txt','w') as f:
+        f.write('========================model_CFG=======================:\n')
+        print(model_CFG, file=f)
+        for name,param in model_CFG.named_parameters():
+            f.write(f"{name:<80}: {param.requires_grad}\n")
+
+        f.write('========================unet=======================:\n')
+        print(unet, file=f)
+        for name,param in unet.named_parameters():
+            f.write(f"{name:<80}: {param.requires_grad}\n")
 
     logger.info("preparing optimizer...")
     lr = cfg.OPTIMIZER.LR * cfg.INPUT.BATCH_SIZE if cfg.OPTIMIZER.SCALE_LR else cfg.OPTIMIZER.LR
@@ -350,10 +374,26 @@ def main(cfg):
     model_CFG, unet, optimizer, train_loader, test_loader, fid_real_loader = accelerator.prepare(
         model_CFG, unet, optimizer, train_loader, test_loader, fid_real_loader)
 
+    # load states
     last_epoch = cfg.MODEL.LAST_EPOCH
     if cfg.MODEL.PRETRAINED_PATH:
         logger.info(f"loading states from {cfg.MODEL.PRETRAINED_PATH}")
-        accelerator.load_state(cfg.MODEL.PRETRAINED_PATH)
+        # model_CFG
+        model_weight_path = cfg.MODEL.PRETRAINED_PATH + "pytorch_model.bin"
+        state_dict = torch.load(model_weight_path, map_location="cpu")
+        state_dict.pop("learnable_vector")
+        # 删掉state_dict中以decoder开头的key
+        update_state_dict = {}
+        for k,v in state_dict.items():
+            if not k.startswith('decoder') and not k.startswith('learnable_vector'):
+                update_state_dict[k] = v
+        logger.info(model_CFG.load_state_dict(update_state_dict, strict=False))
+
+        # unet
+        logger.info(unet.module.load_state_dict(torch.load(
+            os.path.join(cfg.MODEL.PRETRAINED_PATH, "pytorch_model_1.bin"), map_location="cpu"
+        ), strict=False))
+
     global_step = last_epoch * len(train_loader)
 
     logger.info("preparing lr scheduler...")
@@ -402,7 +442,7 @@ def main(cfg):
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # get embedding
-                c, down_block_additional_residuals, up_block_additional_residuals = model_CFG(noisy_latents, timesteps, batch)
+                c, down_block_additional_residuals, up_block_additional_residuals = model_CFG(batch)
                 
                 down_block_additional_residuals = [sample.to(dtype=weight_dtype) for sample in down_block_additional_residuals]
                 up_block_additional_residuals = {k: v.to(dtype=weight_dtype) for k, v in up_block_additional_residuals.items()}
@@ -435,14 +475,19 @@ def main(cfg):
                 # predict
                 with accelerator.autocast():
                     encoder_hidden_states = c.to(dtype=weight_dtype)
+                    
                     model_pred = unet(
                         sample=noisy_latents, timestep=timesteps, encoder_hidden_states=encoder_hidden_states,
                         down_block_additional_residuals=down_block_additional_residuals,
-                        up_block_additional_residuals=up_block_additional_residuals)
+                        up_block_additional_residuals=up_block_additional_residuals,
+                        mask_st=torch.cat([batch["mask_tgt"], batch["mask_src"]], dim=0))
 
+                # TODO: 将attn_loss加到loss中
                 loss_simple = (noise - model_pred) ** 2
                 loss_simple = loss_simple.mean()
+                # loss_simple += attn_loss  # new add
                 loss = loss_simple / cfg.ACCELERATE.GRADIENT_ACCUMULATION_STEPS
+
                 if torch.isnan(loss).any():
                     accelerator.set_trigger()
                 if accelerator.check_trigger():
@@ -474,6 +519,9 @@ def main(cfg):
                     f"Loss {total_loss.val:.4f}({total_loss.avg:.4f})  "
                     f"Lr {optimizer.param_groups[-1]['lr']:.8f}  "
                     f"Eta {datetime.timedelta(seconds=int(etas))}")
+            # new add
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         logger.info(f"epoch {epoch + 1} finished, running time {datetime.timedelta(seconds=int(time.time() - epoch_time))}")
         save_dir = os.path.join(run_dir, f"epochs_{(epoch+1):03d}")
@@ -485,7 +533,7 @@ def main(cfg):
 
             eval(
                 cfg=cfg,
-                model=model,
+                model=model_CFG,
                 test_loader=test_loader,
                 fid_real_loader=fid_real_loader,
                 weight_dtype=weight_dtype,

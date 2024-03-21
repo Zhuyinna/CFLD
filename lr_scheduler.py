@@ -19,6 +19,14 @@ class LinearWarmupMultiStepDecayLRScheduler(torch.optim.lr_scheduler._LRSchedule
         self.num_epochs = num_epochs * iters_per_epoch
         self.override_lr = override_lr
         super(LinearWarmupMultiStepDecayLRScheduler, self).__init__(optimizer, last_epoch, verbose)
+        # 有可能要修改
+
+        # # 确保 optimizer 的每个 param_group 都有 'initial_lr'
+        # for param_group in optimizer.param_groups:
+        #     if 'initial_lr' not in param_group:
+        #         param_group['initial_lr'] = param_group['lr']
+
+        # super(LinearWarmupMultiStepDecayLRScheduler, self).__init__(optimizer, last_epoch, verbose)
 
     def get_lr(self):
         if self.last_epoch < self.warmup_steps:
