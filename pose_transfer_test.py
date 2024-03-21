@@ -467,28 +467,28 @@ def main(cfg):
     unet = UNet(cfg)
     metric = build_metric().to(accelerator.device)
 
-    # logger.info(model.load_state_dict(torch.load(
-    #     os.path.join(cfg.MODEL.PRETRAINED_PATH, "pytorch_model.bin"), map_location="cpu"
-    # ), strict=False))
-    # logger.info(unet.load_state_dict(torch.load(
-    #     os.path.join(cfg.MODEL.PRETRAINED_PATH, "pytorch_model_1.bin"), map_location="cpu"
-    # ), strict=False))
-
-    # model_CFG
-    model_weight_path = os.path.join(cfg.MODEL.PRETRAINED_PATH,"pytorch_model.bin")
-    state_dict = torch.load(model_weight_path, map_location="cpu")
-    state_dict.pop("learnable_vector")
-    # 删掉state_dict中以decoder开头的key和learnable_vector
-    update_state_dict = {}
-    for k,v in state_dict.items():
-        if not k.startswith('decoder') and not k.startswith('learnable_vector'):
-            update_state_dict[k] = v
-    logger.info(model.load_state_dict(update_state_dict, strict=False))
-
-    # unet
+    logger.info(model.load_state_dict(torch.load(
+        os.path.join(cfg.MODEL.PRETRAINED_PATH, "pytorch_model.bin"), map_location="cpu"
+    ), strict=False))
     logger.info(unet.load_state_dict(torch.load(
         os.path.join(cfg.MODEL.PRETRAINED_PATH, "pytorch_model_1.bin"), map_location="cpu"
     ), strict=False))
+
+    # # model_CFG
+    # model_weight_path = os.path.join(cfg.MODEL.PRETRAINED_PATH,"pytorch_model.bin")
+    # state_dict = torch.load(model_weight_path, map_location="cpu")
+    # state_dict.pop("learnable_vector")
+    # # 删掉state_dict中以decoder开头的key和learnable_vector
+    # update_state_dict = {}
+    # for k,v in state_dict.items():
+    #     if not k.startswith('decoder') and not k.startswith('learnable_vector'):
+    #         update_state_dict[k] = v
+    # logger.info(model.load_state_dict(update_state_dict, strict=False))
+
+    # # unet
+    # logger.info(unet.load_state_dict(torch.load(
+    #     os.path.join(cfg.MODEL.PRETRAINED_PATH, "pytorch_model_1.bin"), map_location="cpu"
+    # ), strict=False))
 
     logger.info("preparing accelerator...")
     model, unet, test_loader, fid_real_loader = accelerator.prepare(model, unet, test_loader, fid_real_loader)
