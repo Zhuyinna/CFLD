@@ -5,6 +5,7 @@ fashion
 *.safetensors
 *.pth
 *.bin
+pretrained_models/
 
 # outputs
 outputs/
